@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
-const { scrapeGasBuddy, scrapeMultipleAreas } = require('./gasbuddy-scraper');
+const { scrapeMultipleAreas } = require('./gasbuddy-scraper');
+const { supabase } = require('./supabase');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -9,220 +10,281 @@ const GOOGLE_API_KEY = 'AIzaSyA5P0tX5Nh0U1JqjTqpzB0puuBmWnHIzzc';
 app.use(cors());
 app.use(express.json());
 
+// ─── Background scraper ───────────────────────────────────────────────────────
+
+const SCRAPE_AREAS = [
+  'Kitchener ON', 'Waterloo ON', 'Cambridge ON', 'Guelph ON',
+  'Hamilton ON', 'Burlington ON', 'Oakville ON', 'Milton ON',
+  'Mississauga ON', 'Brampton ON', 'Toronto ON', 'Etobicoke ON',
+  'Scarborough ON', 'North York ON', 'Oshawa ON', 'Whitby ON',
+  'Ajax ON', 'Pickering ON', 'Barrie ON', 'Brantford ON',
+  'London ON', 'Windsor ON', 'Ottawa ON', 'Kingston ON',
+  'Peterborough ON', 'Lakefield ON', 'Norwood ON', 'Bridgenorth ON',
+];
+
+const SCRAPE_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+let isWorkerRunning = false;
+
+async function backgroundScrapeWorker() {
+  if (isWorkerRunning) {
+    console.log('[Worker] Already running, skipping cycle');
+    return;
+  }
+  isWorkerRunning = true;
+  const start = Date.now();
+  console.log('[Worker] Starting scrape at', new Date().toISOString());
+
+  try {
+    const stations = await scrapeMultipleAreas(SCRAPE_AREAS, null, null, 30, null);
+    console.log(`[Worker] Scraped ${stations.length} stations`);
+
+    const now = new Date().toISOString();
+    const withCoords = stations.filter(s => s.lat && s.lng);
+    const toSave = withCoords.map(s => ({
+      id: s.id,
+      name: s.name,
+      address: s.address || '',
+      lat: s.lat,
+      lng: s.lng,
+      brand: s.name,
+      price_per_l: s.price_per_l ?? null,
+      price_updated_at: s.price_per_l ? now : null,
+      photo_url: s.photo_url || null,
+      updated_at: now,
+    }));
+
+    if (toSave.length > 0) {
+      const { error } = await supabase
+        .from('stations')
+        .upsert(toSave, { onConflict: 'id' });
+
+      if (error) console.error('[Worker] DB upsert error:', error.message);
+      else console.log(`[Worker] Saved ${toSave.length} stations (${Date.now() - start}ms)`);
+    }
+  } catch (e) {
+    console.error('[Worker] Scrape failed:', e.message);
+  } finally {
+    isWorkerRunning = false;
+  }
+}
+
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function haversineDistance(lat1, lng1, lat2, lng2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)) * 100) / 100;
+}
+
+const VALHALLA_HOSTS = [
+  'https://valhalla1.openstreetmap.de',
+  'https://valhalla2.openstreetmap.de',
+];
+
+async function valhallaRequest(body, attempt = 0) {
+  const host = VALHALLA_HOSTS[attempt % VALHALLA_HOSTS.length];
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+  try {
+    const response = await fetch(`${host}/sources_to_targets`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'GasOptimizer/1.0' },
+      body,
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    const text = await response.text();
+    return JSON.parse(text); // throws if not JSON
+  } catch (e) {
+    clearTimeout(timeout);
+    if (attempt < VALHALLA_HOSTS.length - 1) {
+      console.warn(`[Driving] Valhalla host ${host} failed, trying next:`, e.message);
+      return valhallaRequest(body, attempt + 1);
+    }
+    throw e;
+  }
+}
+
 async function getDrivingDistances(originLat, originLng, stations) {
   if (!stations.length) return stations;
+
   const batchSize = 25;
   const results = [];
+
   for (let i = 0; i < stations.length; i += batchSize) {
     const batch = stations.slice(i, i + batchSize);
-    const destinations = batch.map(s => `${s.lat},${s.lng}`).join('|');
-    const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${originLat},${originLng}&destinations=${destinations}&key=${GOOGLE_API_KEY}&units=metric`;
+    const body = JSON.stringify({
+      sources: [{ lon: originLng, lat: originLat }],
+      targets: batch.map(s => ({ lon: s.lng, lat: s.lat })),
+      costing: 'auto',
+    });
     try {
-      const response = await fetch(url);
-      const data = await response.json();
-      if (data.status === 'OK') {
-        batch.forEach((station, idx) => {
-          const element = data.rows[0]?.elements[idx];
-          if (element?.status === 'OK') {
-            station.driving_distance_km = Math.round(element.distance.value / 10) / 100;
-            station.driving_duration_min = Math.round(element.duration.value / 60);
+      const data = await valhallaRequest(body);
+      const row = data.sources_to_targets?.[0];
+      if (row) {
+        row.forEach((element, idx) => {
+          if (element?.distance != null && element.distance > 0) {
+            batch[idx].driving_distance_km = Math.round(element.distance * 100) / 100;
+            batch[idx].driving_duration_min = element.time != null ? Math.round(element.time / 60) : undefined;
           }
         });
+        console.log(`[Driving] Valhalla batch ${i / batchSize + 1}: ${batch.length} stations enriched`);
+      } else {
+        console.warn('[Driving] Valhalla unexpected response:', JSON.stringify(data).slice(0, 200));
       }
     } catch (e) {
-      console.warn('Google API error:', e.message);
+      console.warn('[Driving] Valhalla all hosts failed:', e.message);
     }
     results.push(...batch);
   }
   return results;
 }
 
-// Get nearby towns using Google Places
-async function getNearbyTowns(lat, lng, radiusKm = 15) {
-  const radiusMeters = radiusKm * 1000;
-  const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${lat},${lng}&radius=${radiusMeters}&type=locality&key=${GOOGLE_API_KEY}`;
-  
-  try {
-    const response = await fetch(url);
-    const data = await response.json();
-    
-    if (data.status === 'OK') {
-      const towns = data.results.map(place => place.name);
-      return [...new Set(towns)]; // Remove duplicates
-    }
-    return [];
-  } catch (e) {
-    console.warn('Failed to get nearby towns:', e.message);
-    return [];
-  }
-}
+// ─── Location helpers ─────────────────────────────────────────────────────────
 
-// Get user's town from coordinates
-async function reverseGeocode(lat, lng) {
-  const url = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&key=${GOOGLE_API_KEY}`;
-  
+// Use Nominatim (free, no key) to find municipality name from coordinates
+async function getMunicipalityName(lat, lng) {
   try {
-    const response = await fetch(url);
-    const data = await response.json();
-    
-    if (data.status === 'OK' && data.results.length > 0) {
-      // Find locality (city/town) from address components
-      for (const result of data.results) {
-        for (const component of result.address_components) {
-          if (component.types.includes('locality')) {
-            return component.long_name;
-          }
-        }
-      }
-      // Fallback to sublocality or administrative area
-      for (const result of data.results) {
-        for (const component of result.address_components) {
-          if (component.types.includes('sublocality') || 
-              component.types.includes('administrative_area_level_3')) {
-            return component.long_name;
-          }
-        }
-      }
-    }
-    return null;
+    const url = `https://photon.komoot.io/reverse?lat=${lat}&lon=${lng}&limit=1`;
+    const res = await fetch(url, { headers: { 'User-Agent': 'GasOptimizer/1.0' } });
+    const data = await res.json();
+    const p = data.features?.[0]?.properties || {};
+    return p.city || p.town || p.village || p.county || null;
   } catch (e) {
     console.warn('Reverse geocode failed:', e.message);
     return null;
   }
 }
 
-// Smart search endpoint - automatically finds nearby towns and searches all
-app.get('/api/gasbuddy/smart', async (req, res) => {
+// Find all towns/cities within radiusKm of a point using Nominatim.
+// Sequential with small delay to avoid rate-limiting (Nominatim blocks parallel bursts).
+async function getNearbyMunicipalities(lat, lng, radiusKm) {
+  const municipalities = new Set();
+  const stepDeg = radiusKm / 111;
+  // Use a sparser 3×3 grid (9 calls) rather than 5×5 (25 calls) to stay under rate limit
+  const offsets = [-1, 0, 1];
+
+  for (const dLat of offsets) {
+    for (const dLng of offsets) {
+      const name = await getMunicipalityName(lat + dLat * stepDeg, lng + dLng * stepDeg);
+      if (name) municipalities.add(`${name} ON`);
+      await new Promise(r => setTimeout(r, 200)); // 200ms between calls
+    }
+  }
+
+  return Array.from(municipalities);
+}
+
+// Cache of recently scraped locations to avoid hammering GasBuddy
+const recentlyScrape = new Map(); // key -> timestamp
+const SCRAPE_COOLDOWN_MS = 20 * 60 * 1000; // 20 min per area
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
+
+app.get('/api/stations/nearby', async (req, res) => {
   try {
-    const { lat, lng, radius, maxPerArea, maxDistance } = req.query;
-    
+    const { lat, lng, radius } = req.query;
     const userLat = parseFloat(lat);
     const userLng = parseFloat(lng);
-    const searchRadius = parseInt(radius) || 15;
-    const perArea = parseInt(maxPerArea) || 10;
-    const maxDist = parseFloat(maxDistance) || 30;
-    
+    const maxRadius = parseFloat(radius) || 15;
+
     if (!userLat || !userLng) {
       return res.status(400).json({ success: false, error: 'lat and lng required' });
     }
-    
-    console.log('Smart search for:', userLat, userLng, 'radius:', searchRadius);
-    
-    // Get user's town
-    const userTown = await reverseGeocode(userLat, userLng);
-    console.log('User town:', userTown);
-    
-    // Get nearby towns
-    let nearbyTowns = await getNearbyTowns(userLat, userLng, searchRadius);
-    console.log('Nearby towns:', nearbyTowns);
-    
-    // Build search terms (user's town + nearby towns + province)
-    const searchTerms = [];
-    
-    // Add common nearby area names for better coverage
-    const additionalAreas = [
-      `${userLat.toFixed(2)},${userLng.toFixed(2)}`, // Coordinates search
-    ];
 
-    // If user's town is known, add variations
-    if (userTown) {
-    searchTerms.push(`${userTown} ON`);
-   } 
+    // Query DB for stations near this location
+    const getFromDB = async () => {
+      const { data: allStations, error } = await supabase
+        .from('stations')
+        .select('*')
+        .not('price_per_l', 'is', null);
+      if (error) throw error;
+      return allStations
+        .map(s => ({
+          ...s,
+          lat: parseFloat(s.lat),
+          lng: parseFloat(s.lng),
+          distance_km: haversineDistance(userLat, userLng, parseFloat(s.lat), parseFloat(s.lng)),
+        }))
+        .filter(s => s.distance_km <= maxRadius)
+        .sort((a, b) => a.distance_km - b.distance_km)
+        .slice(0, 60);
+    };
 
-    // Add nearby towns
-    nearbyTowns.forEach(town => {
-      if (town !== userTown) {
-        searchTerms.push(`${town} ON`);
+    let nearby = await getFromDB();
+
+    // If we have fewer than 5 stations, try a dynamic scrape — but always return
+    // whatever is in the DB afterwards, even if the scrape fails or fires nothing.
+    if (nearby.length < 5) {
+      console.log(`Only ${nearby.length} stations in DB near ${userLat},${userLng} — triggering dynamic scrape`);
+
+      try {
+        const municipalities = await getNearbyMunicipalities(userLat, userLng, maxRadius);
+        console.log('Scraping municipalities:', municipalities);
+
+        const toScrape = municipalities.filter(m => {
+          const last = recentlyScrape.get(m);
+          return !last || (Date.now() - last > SCRAPE_COOLDOWN_MS);
+        });
+
+        if (toScrape.length > 0) {
+          const stations = await scrapeMultipleAreas(toScrape, userLat, userLng, 30, null);
+          console.log(`Dynamic scrape got ${stations.length} stations`);
+
+          const now = new Date().toISOString();
+          const withCoords = stations.filter(s => s.lat && s.lng);
+          await enrichWithPhotos(withCoords);
+          const toSave = withCoords.map(s => ({
+            id: s.id,
+            name: s.name,
+            address: s.address || '',
+            lat: s.lat,
+            lng: s.lng,
+            brand: s.name,
+            price_per_l: s.price_per_l ?? null,
+            price_updated_at: s.price_per_l ? now : null,
+            photo_url: s.photo_url || null,
+            updated_at: now,
+          }));
+
+          if (toSave.length > 0) {
+            await supabase.from('stations').upsert(toSave, { onConflict: 'id' });
+          }
+
+          for (const m of toScrape) recentlyScrape.set(m, Date.now());
+
+          // Re-query DB with fresh data
+          nearby = await getFromDB();
+        }
+      } catch (e) {
+        console.error('Dynamic scrape failed:', e.message);
+        // Fall through — return whatever is in DB rather than erroring
       }
-    });
-
-    // Add coordinate-based search as fallback
-    searchTerms.push(...additionalAreas);
-
-    // Remove duplicates and limit
-    const uniqueTerms = [...new Set(searchTerms)];
-    const limitedSearchTerms = uniqueTerms.slice(0, 8);
-    console.log('Searching:', limitedSearchTerms);
-    
-    // Search all towns
-    let stations = await scrapeMultipleAreas(limitedSearchTerms, userLat, userLng, perArea, maxDist);
-    
-    // Get driving distances
-    if (stations.length > 0) {
-      stations = await getDrivingDistances(userLat, userLng, stations);
-      stations.sort((a, b) => (a.price_per_l || 999) - (b.price_per_l || 999));
     }
-    
-    res.json({ 
-      success: true, 
-      searchTerms: limitedSearchTerms,
-      stations 
-    });
+
+    const withDriving = await getDrivingDistances(userLat, userLng, nearby);
+    res.json({ success: true, stations: withDriving });
   } catch (e) {
-    console.error('Smart search error:', e);
+    console.error('Nearby error:', e);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-app.get('/api/gasbuddy/:postalCode', async (req, res) => {
-  try {
-    const { postalCode } = req.params;
-    const { lat, lng, max, driving } = req.query;
-    const userLat = lat ? parseFloat(lat) : null;
-    const userLng = lng ? parseFloat(lng) : null;
-    const maxStations = max ? parseInt(max) : 15;
-    const includeDriving = driving === 'true';
-    console.log('Scraping GasBuddy for:', postalCode, 'user location:', userLat, userLng);
-    let stations = await scrapeGasBuddy(postalCode, userLat, userLng, maxStations);
-    if (includeDriving && userLat && userLng) {
-      stations = await getDrivingDistances(userLat, userLng, stations);
-      stations.sort((a, b) => (a.driving_distance_km || 999) - (b.driving_distance_km || 999));
-    }
-    res.json({ success: true, stations });
-  } catch (e) {
-    console.error('Scraper error:', e);
-    res.status(500).json({ success: false, error: e.message });
-  }
+// Worker status endpoint
+app.get('/api/worker/status', (req, res) => {
+  res.json({ running: isWorkerRunning });
 });
 
-app.post('/api/gasbuddy/multi', async (req, res) => {
-  try {
-    const { searchTerms, lat, lng, maxPerArea, maxDistance, driving } = req.body;
-    const userLat = lat ? parseFloat(lat) : null;
-    const userLng = lng ? parseFloat(lng) : null;
-    const perArea = maxPerArea || 10;
-    const maxDist = maxDistance || null;
-    const includeDriving = driving === true;
-    console.log('Multi-area search:', searchTerms, 'user location:', userLat, userLng);
-    let stations = await scrapeMultipleAreas(searchTerms, userLat, userLng, perArea, maxDist);
-    if (includeDriving && userLat && userLng) {
-      stations = await getDrivingDistances(userLat, userLng, stations);
-      stations.sort((a, b) => (a.driving_distance_km || 999) - (b.driving_distance_km || 999));
-    }
-    res.json({ success: true, stations });
-  } catch (e) {
-    console.error('Scraper error:', e);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.use('/api/nhtsa', async (req, res) => {
-  try {
-    const path = req.url;
-    const url = `https://vpic.nhtsa.dot.gov/api/vehicles${path}`;
-    const response = await fetch(url);
-    const body = await response.text();
-    res.set('Content-Type', 'application/json');
-    res.status(response.status).send(body);
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
-
+// Fueleconomy proxy (used by profile screen)
 app.use('/api/fueleconomy', async (req, res) => {
   try {
-    const path = req.url;
-    const url = `https://www.fueleconomy.gov/ws/rest${path}`;
+    const url = `https://www.fueleconomy.gov/ws/rest${req.url}`;
     const response = await fetch(url);
     const body = await response.text();
     res.set('Content-Type', 'application/xml');
@@ -232,8 +294,45 @@ app.use('/api/fueleconomy', async (req, res) => {
   }
 });
 
+app.get('/health', (req, res) => res.json({ status: 'ok', workerRunning: isWorkerRunning }));
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+
+async function backfillPhotos() {
+  try {
+    const { data: stations, error } = await supabase
+      .from('stations')
+      .select('id, name, address')
+      .is('photo_url', null)
+      .not('address', 'eq', '');
+
+    if (error || !stations?.length) return;
+    console.log(`[Backfill] Fetching photos for ${stations.length} stations...`);
+
+    for (let i = 0; i < stations.length; i += 5) {
+      const batch = stations.slice(i, i + 5);
+      await Promise.all(batch.map(async (s) => {
+        const url = await getGooglePhotoUrl(s.name, s.address);
+        if (url) {
+          await supabase.from('stations').update({ photo_url: url }).eq('id', s.id);
+        }
+      }));
+    }
+    console.log('[Backfill] Done');
+  } catch (e) {
+    console.warn('[Backfill] Failed:', e.message);
+  }
+}
+
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log('Proxy server listening on http://localhost:' + PORT);
+
+  // Kick off background scraper immediately, then every 10 minutes
+  backgroundScrapeWorker();
+  setInterval(backgroundScrapeWorker, SCRAPE_INTERVAL_MS);
+
+  // Backfill photos for existing stations missing them
+  setTimeout(backfillPhotos, 5000);
 });
 
 server.on('error', (err) => {

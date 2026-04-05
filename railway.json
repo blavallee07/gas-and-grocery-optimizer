@@ -1,9 +1,0 @@
-{
-  "build": {
-    "builder": "NIXPACKS"
-  },
-  "deploy": {
-    "startCommand": "node server/api-only.js",
-    "restartPolicyType": "ON_FAILURE"
-  }
-}

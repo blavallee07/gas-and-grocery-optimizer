@@ -94,7 +94,7 @@ async function populateDatabase() {
     
     // If we get too many empty results, take a longer break
     if (consecutiveEmpty >= 3) {
-      console.log('\n⚠️  Detected possible rate limiting. Taking a 2 minute break...\n');
+      console.log('\nDetected possible rate limiting. Taking a 2 minute break...\n');
       await delay(120000);
       consecutiveEmpty = 0;
       
