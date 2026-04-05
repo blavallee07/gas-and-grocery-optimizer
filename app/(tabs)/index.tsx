@@ -9,26 +9,14 @@ export default function HomeScreen() {
   const [profile, setProfile] = useState<any>(null);
   const [userName, setUserName] = useState<string>('');
 
-  useEffect(() => {
-    loadProfile();
-  }, []);
+  useEffect(() => { loadProfile(); }, []);
 
   const loadProfile = async () => {
     try {
       const { data: { session } } = await supabase.auth.getSession();
-      if (!session?.user) {
-        router.replace('/login');
-        return;
-      }
-
+      if (!session?.user) { router.replace('/login'); return; }
       setUserName(session.user.email?.split('@')[0] || 'there');
-
-      const { data } = await supabase
-        .from('profiles')
-        .select('*')
-        .eq('id', session.user.id)
-        .maybeSingle();
-      
+      const { data } = await supabase.from('profiles').select('*').eq('id', session.user.id).maybeSingle();
       setProfile(data);
     } catch (e) {
       console.error('Load error:', e);
@@ -43,270 +31,177 @@ export default function HomeScreen() {
   };
 
   if (loading) {
-    return (
-      <View style={styles.centered}>
-        <ActivityIndicator size="large" color="#4285F4" />
-      </View>
-    );
+    return <View style={s.centered}><ActivityIndicator size="large" color="#4285F4" /></View>;
   }
 
   const hasLocation = profile?.home_lat && profile?.home_lng;
   const hasVehicle = profile?.vehicle_year && profile?.vehicle_make;
+  const vehicle = hasVehicle
+    ? `${profile.vehicle_year} ${profile.vehicle_make}${profile.vehicle_model ? ' ' + profile.vehicle_model : ''}`
+    : null;
 
   return (
-    <View style={styles.container}>
-      <View style={styles.header}>
-        <Text style={styles.greeting}>Hello, {userName}!</Text>
-        <Text style={styles.subtitle}>Ready to save on gas?</Text>
+    <View style={s.container}>
+      {/* Dark header */}
+      <View style={s.header}>
+        <View>
+          <Text style={s.greeting}>Hello, {userName}</Text>
+          <Text style={s.sub}>Ready to save on gas?</Text>
+        </View>
+        <TouchableOpacity style={s.settingsBtn} onPress={() => router.push('/profile')}>
+          <Text style={s.settingsBtnText}>Settings</Text>
+        </TouchableOpacity>
       </View>
 
-      {/* Quick Actions */}
-      <View style={styles.actionsContainer}>
-        <TouchableOpacity 
-          style={[styles.mainAction, !hasLocation && styles.actionDisabled]} 
+      {/* Main CTA */}
+      <View style={s.body}>
+        <TouchableOpacity
+          style={[s.cta, !hasLocation && s.ctaDisabled]}
           onPress={() => router.push('/gas')}
           disabled={!hasLocation}
+          activeOpacity={0.88}
         >
-          <Text style={styles.mainActionEmoji}></Text>
-          <Text style={styles.mainActionText}>Find Gas</Text>
-          <Text style={styles.mainActionSubtext}>
-            {hasLocation ? 'See nearby prices' : 'Set location first'}
+          <Text style={s.ctaLabel}>Find Gas</Text>
+          <Text style={s.ctaSub}>
+            {hasLocation ? 'See the best prices near you' : 'Set your location in Settings first'}
           </Text>
         </TouchableOpacity>
 
-        <View style={styles.secondaryActions}>
-          <TouchableOpacity 
-            style={styles.secondaryAction} 
+        {/* Stats row */}
+        <View style={s.statsRow}>
+          <StatCard
+            label="Vehicle"
+            value={vehicle ?? '—'}
+            dim={!hasVehicle}
             onPress={() => router.push('/profile')}
-          >
-            <Text style={styles.secondaryEmoji}></Text>
-            <Text style={styles.secondaryText}>Profile</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity 
-            style={[styles.secondaryAction, styles.comingSoon]} 
-            disabled
-          >
-            <Text style={styles.secondaryEmoji}></Text>
-            <Text style={styles.secondaryText}>Groceries</Text>
-            <Text style={styles.comingSoonText}>Soon</Text>
-          </TouchableOpacity>
+          />
+          <StatCard
+            label="Search radius"
+            value={profile?.search_radius_km ? `${profile.search_radius_km} km` : '—'}
+            dim={!profile?.search_radius_km}
+            onPress={() => router.push('/profile')}
+          />
+          <StatCard
+            label="Efficiency"
+            value={profile?.fuel_efficiency ? `${profile.fuel_efficiency} L/100` : '—'}
+            dim={!profile?.fuel_efficiency}
+            onPress={() => router.push('/profile')}
+          />
         </View>
-      </View>
 
-      {/* Status Cards */}
-      <View style={styles.statusSection}>
-        <Text style={styles.sectionTitle}>Setup Status</Text>
-        
-        <View style={[styles.statusCard, hasLocation ? styles.statusComplete : styles.statusIncomplete]}>
-          <Text style={styles.statusIcon}></Text>
-          <View style={styles.statusInfo}>
-            <Text style={styles.statusTitle}>Home Location</Text>
-            <Text style={styles.statusSubtitle}>
-              {hasLocation 
-                ? `${parseFloat(profile.home_lat).toFixed(2)}, ${parseFloat(profile.home_lng).toFixed(2)}` 
-                : 'Not set'}
+        {/* Setup nudge */}
+        {(!hasLocation || !hasVehicle) && (
+          <TouchableOpacity style={s.nudge} onPress={() => router.push('/profile')}>
+            <View style={s.nudgeDot} />
+            <Text style={s.nudgeText}>
+              {!hasLocation && !hasVehicle
+                ? 'Set your location and vehicle to get started'
+                : !hasLocation
+                ? 'Set your location to find nearby prices'
+                : 'Add your vehicle for accurate savings estimates'}
             </Text>
-          </View>
-          {!hasLocation && (
-            <TouchableOpacity onPress={() => router.push('/profile')}>
-              <Text style={styles.statusAction}>Set</Text>
-            </TouchableOpacity>
-          )}
-        </View>
-
-        <View style={[styles.statusCard, hasVehicle ? styles.statusComplete : styles.statusIncomplete]}>
-          <Text style={styles.statusIcon}></Text>
-          <View style={styles.statusInfo}>
-            <Text style={styles.statusTitle}>Vehicle</Text>
-            <Text style={styles.statusSubtitle}>
-              {hasVehicle 
-                ? `${profile.vehicle_year} ${profile.vehicle_make} ${profile.vehicle_model || ''}` 
-                : 'Not set'}
-            </Text>
-          </View>
-          {!hasVehicle && (
-            <TouchableOpacity onPress={() => router.push('/profile')}>
-              <Text style={styles.statusAction}>Set</Text>
-            </TouchableOpacity>
-          )}
-        </View>
-
-        {profile?.fuel_efficiency && (
-          <View style={styles.infoCard}>
-            <Text style={styles.infoLabel}>Fuel Efficiency</Text>
-            <Text style={styles.infoValue}>{profile.fuel_efficiency} L/100km</Text>
-          </View>
+            <Text style={s.nudgeArrow}>›</Text>
+          </TouchableOpacity>
         )}
       </View>
 
-      {/* Sign Out */}
-      <TouchableOpacity style={styles.signOutButton} onPress={handleSignOut}>
-        <Text style={styles.signOutText}>Sign Out</Text>
+      {/* Sign out */}
+      <TouchableOpacity style={s.signOut} onPress={handleSignOut}>
+        <Text style={s.signOutText}>Sign out</Text>
       </TouchableOpacity>
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#f5f5f5',
-    padding: 16,
-  },
-  centered: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: '#f5f5f5',
-  },
+function StatCard({ label, value, dim, onPress }: { label: string; value: string; dim: boolean; onPress: () => void }) {
+  return (
+    <TouchableOpacity style={[s.stat, dim && s.statDim]} onPress={onPress} activeOpacity={0.7}>
+      <Text style={s.statValue} numberOfLines={1}>{value}</Text>
+      <Text style={s.statLabel}>{label}</Text>
+    </TouchableOpacity>
+  );
+}
+
+const s = StyleSheet.create({
+  container: { flex: 1, backgroundColor: '#f2f2f7' },
+  centered: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#f2f2f7' },
+
   header: {
-    marginTop: 50,
-    marginBottom: 24,
-  },
-  greeting: {
-    fontSize: 28,
-    fontWeight: 'bold',
-    color: '#1a1a2e',
-  },
-  subtitle: {
-    fontSize: 16,
-    color: '#666',
-    marginTop: 4,
-  },
-  actionsContainer: {
-    marginBottom: 24,
-  },
-  mainAction: {
-    backgroundColor: '#4caf50',
-    borderRadius: 16,
-    padding: 24,
-    alignItems: 'center',
-    marginBottom: 12,
-    shadowColor: '#4caf50',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
-    elevation: 4,
-  },
-  actionDisabled: {
-    backgroundColor: '#bdbdbd',
-    shadowColor: '#000',
-  },
-  mainActionText: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    color: '#fff',
-  },
-  mainActionSubtext: {
-    fontSize: 14,
-    color: 'rgba(255,255,255,0.8)',
-    marginTop: 4,
-  },
-  secondaryActions: {
-    flexDirection: 'row',
-    gap: 12,
-  },
-  secondaryAction: {
-    flex: 1,
-    backgroundColor: '#fff',
-    borderRadius: 12,
-    padding: 16,
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.1,
-    shadowRadius: 2,
-    elevation: 2,
-  },
-  comingSoon: {
-    opacity: 0.6,
-  },
-  secondaryText: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#333',
-  },
-  comingSoonText: {
-    fontSize: 10,
-    color: '#999',
-    marginTop: 2,
-  },
-  statusSection: {
-    flex: 1,
-  },
-  sectionTitle: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#666',
-    marginBottom: 12,
-  },
-  statusCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#fff',
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 10,
-  },
-  statusComplete: {
-    borderLeftWidth: 4,
-    borderLeftColor: '#4caf50',
-  },
-  statusIncomplete: {
-    borderLeftWidth: 4,
-    borderLeftColor: '#ff9800',
-  },
-  statusIcon: {
-    fontSize: 20,
-    marginRight: 12,
-  },
-  statusInfo: {
-    flex: 1,
-  },
-  statusTitle: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#333',
-  },
-  statusSubtitle: {
-    fontSize: 12,
-    color: '#666',
-    marginTop: 2,
-  },
-  statusAction: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#4285F4',
-  },
-  infoCard: {
-    backgroundColor: '#e3f2fd',
-    borderRadius: 12,
-    padding: 14,
+    backgroundColor: '#1a1a2e',
+    paddingTop: 64,
+    paddingBottom: 28,
+    paddingHorizontal: 24,
     flexDirection: 'row',
     justifyContent: 'space-between',
-    alignItems: 'center',
+    alignItems: 'flex-end',
+    borderBottomLeftRadius: 28,
+    borderBottomRightRadius: 28,
   },
-  infoLabel: {
-    fontSize: 14,
-    color: '#1976d2',
-  },
-  infoValue: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#1976d2',
-  },
-  signOutButton: {
-    backgroundColor: '#fff',
-    borderRadius: 8,
-    padding: 14,
-    alignItems: 'center',
+  greeting: { fontSize: 26, fontWeight: '700', color: '#fff' },
+  sub: { fontSize: 13, color: 'rgba(255,255,255,0.5)', marginTop: 3 },
+  settingsBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    borderRadius: 20,
     borderWidth: 1,
-    borderColor: '#ddd',
-    marginTop: 'auto',
+    borderColor: 'rgba(255,255,255,0.25)',
   },
-  signOutText: {
-    fontSize: 14,
-    color: '#666',
+  settingsBtnText: { color: 'rgba(255,255,255,0.8)', fontSize: 13, fontWeight: '500' },
+
+  body: { flex: 1, paddingHorizontal: 20, paddingTop: 28, gap: 16 },
+
+  cta: {
+    backgroundColor: '#4285F4',
+    borderRadius: 18,
+    paddingVertical: 22,
+    paddingHorizontal: 24,
+    shadowColor: '#4285F4',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.3,
+    shadowRadius: 12,
+    elevation: 6,
   },
+  ctaDisabled: {
+    backgroundColor: '#9e9e9e',
+    shadowColor: '#000',
+    shadowOpacity: 0.08,
+  },
+  ctaLabel: { fontSize: 22, fontWeight: '700', color: '#fff' },
+  ctaSub: { fontSize: 13, color: 'rgba(255,255,255,0.75)', marginTop: 4 },
+
+  statsRow: { flexDirection: 'row', gap: 10 },
+  stat: {
+    flex: 1,
+    backgroundColor: '#fff',
+    borderRadius: 14,
+    padding: 14,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 4,
+    elevation: 1,
+  },
+  statDim: { opacity: 0.45 },
+  statValue: { fontSize: 13, fontWeight: '700', color: '#1a1a2e', marginBottom: 4 },
+  statLabel: { fontSize: 11, color: '#999', textTransform: 'uppercase', letterSpacing: 0.4 },
+
+  nudge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    padding: 14,
+    gap: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 3,
+    elevation: 1,
+  },
+  nudgeDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#ffb300' },
+  nudgeText: { flex: 1, fontSize: 13, color: '#555', lineHeight: 18 },
+  nudgeArrow: { fontSize: 18, color: '#ccc' },
+
+  signOut: { paddingBottom: 36, alignItems: 'center' },
+  signOutText: { fontSize: 13, color: '#bbb' },
 });

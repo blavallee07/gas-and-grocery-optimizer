@@ -2,7 +2,7 @@ import { supabase } from '@/lib/supabase';
 import { Picker } from '@react-native-picker/picker';
 import * as Location from 'expo-location';
 import { useRouter } from 'expo-router';
-import { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 
 const PROXY_BASE = 'http://localhost:3001/api';
@@ -57,6 +57,10 @@ export default function ProfileScreen() {
   const [modelsLoading, setModelsLoading] = useState(false);
   const [locationLoading, setLocationLoading] = useState(false);
   const [locationFailed, setLocationFailed] = useState(false);
+  const [locationError, setLocationError] = useState<string | null>(null);
+  const [addressInput, setAddressInput] = useState('');
+  const [addressSuggestions, setAddressSuggestions] = useState<{ label: string; lat: number; lon: number }[]>([]);
+  const addressDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
 
   const makesCache = useRef<Record<string, string[]>>({});
@@ -92,13 +96,12 @@ export default function ProfileScreen() {
         if (!mounted) return;
 
         if (data) {
-          console.log('Profile data loaded successfully');
           savedVehicleData.current = {
             make: data.vehicle_make ?? '',
             model: data.vehicle_model ?? '',
             trim: data.vehicle_trim ?? '',
           };
-          
+
           setProfile({
             vehicle_year: data.vehicle_year?.toString() ?? '',
             vehicle_make: data.vehicle_make ?? '',
@@ -113,8 +116,18 @@ export default function ProfileScreen() {
             min_savings: data.min_savings?.toString() ?? '1.0',
             search_radius_km: data.search_radius_km?.toString() ?? '15.0',
           });
-        } else {
-          console.log('No existing profile data, starting fresh');
+
+          // Reverse geocode saved coordinates so the address field isn't blank
+          if (data.home_lat && data.home_lng) {
+            fetch(`https://photon.komoot.io/reverse?lat=${data.home_lat}&lon=${data.home_lng}&limit=1`)
+              .then(r => r.json())
+              .then(d => {
+                const p = d.features?.[0]?.properties || {};
+                const parts = [p.name || p.street, p.city || p.town || p.village, p.state].filter(Boolean);
+                if (parts.length && mounted) setAddressInput(parts.join(', '));
+              })
+              .catch(() => {});
+          }
         }
       } catch (e: any) {
         console.error('Load profile error:', e);
@@ -163,12 +176,9 @@ export default function ProfileScreen() {
           makesCache.current[year] = makesList;
         }
         setMakes(makesList);
-        
-        if (!initialLoadDone.current && savedVehicleData.current.make) {
-          if (makesList.includes(savedVehicleData.current.make)) {
-            setProfile((p: any) => ({ ...p, vehicle_make: savedVehicleData.current.make }));
-          }
-        } else if (initialLoadDone.current) {
+
+        // Only clear downstream values when the user actively changes the year
+        if (initialLoadDone.current) {
           setModels([]);
           setTrims([]);
           setProfile((p: any) => ({ ...p, vehicle_make: '', vehicle_model: '', vehicle_trim: '' }));
@@ -212,13 +222,11 @@ export default function ProfileScreen() {
           modelsCache.current[cacheKey] = modelsList;
         }
         setModels(modelsList);
-        
-        if (!initialLoadDone.current && savedVehicleData.current.model) {
-          if (modelsList.includes(savedVehicleData.current.model)) {
-            setProfile((p: any) => ({ ...p, vehicle_model: savedVehicleData.current.model }));
-          }
-          setTimeout(() => { initialLoadDone.current = true; }, 500);
-        } else if (initialLoadDone.current) {
+
+        if (!initialLoadDone.current) {
+          initialLoadDone.current = true;
+        } else {
+          // User actively changed the make — clear downstream
           setTrims([]);
           setProfile((p: any) => ({ ...p, vehicle_model: '', vehicle_trim: '' }));
         }
@@ -394,256 +402,251 @@ export default function ProfileScreen() {
 
   const getLocation = async () => {
     setLocationFailed(false);
+    setLocationError(null);
     setLocationLoading(true);
     try {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Permission denied', 'Location permission is required.');
-        setLocationFailed(true);
-        return;
+      let latitude: number;
+      let longitude: number;
+
+      if (typeof window !== 'undefined' && window.navigator?.geolocation) {
+        // Try browser geolocation first, fall back to IP-based
+        const browserPos = await new Promise<{ latitude: number; longitude: number } | null>((resolve) => {
+          window.navigator.geolocation.getCurrentPosition(
+            (pos) => resolve({ latitude: pos.coords.latitude, longitude: pos.coords.longitude }),
+            () => resolve(null),
+            { timeout: 10000, enableHighAccuracy: true }
+          );
+        });
+
+        if (browserPos) {
+          latitude = browserPos.latitude;
+          longitude = browserPos.longitude;
+        } else {
+          // IP geolocation fallback — no permissions required
+          const res = await fetch('https://ipapi.co/json/');
+          const data = await res.json();
+          if (!data.latitude || !data.longitude) throw new Error('IP geolocation failed');
+          latitude = data.latitude;
+          longitude = data.longitude;
+        }
+      } else {
+        // Native: use expo-location
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          Alert.alert('Permission denied', 'Location permission is required.');
+          setLocationFailed(true);
+          return;
+        }
+        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+        latitude = pos.coords.latitude;
+        longitude = pos.coords.longitude;
       }
-      const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High, timeout: 15000 });
-      setProfile((p: any) => ({ 
-        ...p, 
-        home_lat: String(pos.coords.latitude), 
-        home_lng: String(pos.coords.longitude) 
+
+      setProfile((p: any) => ({
+        ...p,
+        home_lat: String(latitude),
+        home_lng: String(longitude),
       }));
     } catch (e: any) {
       console.error('Location error', e);
       setLocationFailed(true);
-      Alert.alert('Error', e.message || 'Failed to get location');
+      setLocationError(`Failed to get location: ${e?.message || 'unknown error'}`);
     } finally {
       setLocationLoading(false);
     }
+  };
+
+  const onAddressChange = (text: string) => {
+    setAddressInput(text);
+    if (addressDebounce.current) clearTimeout(addressDebounce.current);
+    if (!text.trim() || text.length < 3) {
+      setAddressSuggestions([]);
+      return;
+    }
+    addressDebounce.current = setTimeout(async () => {
+      try {
+        const encoded = encodeURIComponent(text.trim());
+        const res = await fetch(`https://photon.komoot.io/api/?q=${encoded}&limit=5`);
+        const data = await res.json();
+        const suggestions = (data.features || []).map((f: any) => {
+          const p = f.properties;
+          const parts = [p.name, p.street, p.city || p.town || p.village, p.state].filter(Boolean);
+          return {
+            label: parts.join(', '),
+            lat: f.geometry.coordinates[1],
+            lon: f.geometry.coordinates[0],
+          };
+        });
+        setAddressSuggestions(suggestions);
+      } catch {
+        setAddressSuggestions([]);
+      }
+    }, 400);
+  };
+
+  const selectAddress = (item: { label: string; lat: number; lon: number }) => {
+    setProfile((p: any) => ({
+      ...p,
+      home_lat: String(item.lat),
+      home_lng: String(item.lon),
+    }));
+    setAddressInput(item.label);
+    setAddressSuggestions([]);
+    setLocationFailed(false);
+    setLocationError(null);
   };
 
   if (loading) {
     return (
       <View style={styles.centered}>
         <ActivityIndicator size="large" color="#4285F4" />
-        <Text style={styles.loadingText}>Loading profile...</Text>
       </View>
     );
   }
 
   return (
     <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-      <ScrollView style={styles.scrollView} contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
-        <Text style={styles.title}>Your Profile</Text>
+      <ScrollView style={styles.scrollView} contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
+
+        {/* Hero */}
+        <View style={styles.hero}>
+          <TouchableOpacity style={styles.backBtn} onPress={() => router.back()}>
+            <Text style={styles.backBtnText}>‹</Text>
+          </TouchableOpacity>
+          <Text style={styles.heroTitle}>Profile</Text>
+          <Text style={styles.heroSub}>Vehicle, location & preferences</Text>
+        </View>
 
         {apiError && (
-          <View style={styles.errorBox}>
-            <Text style={styles.errorText}>{apiError}</Text>
-            <Text style={styles.errorSubtext}>You can still enter vehicle information manually below.</Text>
-            <TouchableOpacity onPress={() => setApiError(null)} style={styles.dismissButton}>
-              <Text style={styles.dismissButtonText}>Dismiss</Text>
+          <View style={styles.banner}>
+            <Text style={styles.bannerText}>{apiError}</Text>
+            <TouchableOpacity onPress={() => setApiError(null)}>
+              <Text style={styles.bannerDismiss}>Dismiss</Text>
             </TouchableOpacity>
           </View>
         )}
 
-        {/* Vehicle Section */}
+        {/* Vehicle */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Vehicle Information</Text>
-          
-          <Text style={styles.label}>Year</Text>
-          <View style={styles.pickerContainer}>
-            <Picker 
-              selectedValue={profile.vehicle_year} 
-              onValueChange={(v) => setProfile({ ...profile, vehicle_year: v })}
-              style={styles.picker}
-            >
-              <Picker.Item label="Select year" value="" />
-              {years.map((y) => (
-                <Picker.Item key={y} label={y} value={y} />
-              ))}
-            </Picker>
-          </View>
+          <Text style={styles.sectionTitle}>Vehicle</Text>
 
-          <Text style={styles.label}>Make</Text>
-          <View style={styles.pickerContainer}>
-            <Picker
-              selectedValue={profile.vehicle_make}
-              onValueChange={(v) => setProfile({ ...profile, vehicle_make: v })}
-              enabled={!!profile.vehicle_year && !makesLoading}
-              style={styles.picker}
-            >
-              <Picker.Item label={makesLoading ? 'Loading...' : 'Select make'} value="" />
-              {makes.map((m) => <Picker.Item key={m} label={m} value={m} />)}
-            </Picker>
-          </View>
-
-          <Text style={styles.label}>Model</Text>
-          <View style={styles.pickerContainer}>
-            <Picker
-              selectedValue={profile.vehicle_model}
-              onValueChange={(v) => setProfile({ ...profile, vehicle_model: v })}
-              enabled={!!profile.vehicle_make && !modelsLoading}
-              style={styles.picker}
-            >
-              <Picker.Item label={modelsLoading ? 'Loading...' : 'Select model'} value="" />
-              {models.map((m) => <Picker.Item key={m} label={m} value={m} />)}
-            </Picker>
-          </View>
-
-          <Text style={styles.label}>Trim</Text>
-          {trims.length > 0 ? (
-            <View style={styles.pickerContainer}>
-              <Picker 
-                selectedValue={selectedTrimId} 
-                onValueChange={(v) => {
-                  setSelectedTrimId(v);
-                  const found = trims.find(t => t.value === v);
-                  setProfile((p: any) => ({ ...p, vehicle_trim: found?.text ?? '' }));
-                }}
-                style={styles.picker}
-              >
-                <Picker.Item label="Select trim" value="" />
-                {trims.map((t) => (
-                  <Picker.Item key={t.value} label={t.text} value={t.value} />
-                ))}
+          <Field label="Year">
+            <View style={styles.pickerWrap}>
+              <Picker selectedValue={profile.vehicle_year} onValueChange={(v) => setProfile({ ...profile, vehicle_year: v })} style={styles.picker}>
+                <Picker.Item label="Select year" value="" />
+                {years.map((y) => <Picker.Item key={y} label={y} value={y} />)}
               </Picker>
             </View>
-          ) : (
-            <TextInput 
-              style={styles.input} 
-              value={profile.vehicle_trim} 
-              onChangeText={(t) => setProfile({ ...profile, vehicle_trim: t })} 
-              placeholder="Enter trim (optional)"
-            />
-          )}
+          </Field>
+
+          <Field label="Make">
+            <View style={styles.pickerWrap}>
+              <Picker selectedValue={profile.vehicle_make} onValueChange={(v) => setProfile({ ...profile, vehicle_make: v })} enabled={!!profile.vehicle_year && !makesLoading} style={styles.picker}>
+                <Picker.Item label={makesLoading ? 'Loading...' : 'Select make'} value="" />
+                {makes.map((m) => <Picker.Item key={m} label={m} value={m} />)}
+              </Picker>
+            </View>
+          </Field>
+
+          <Field label="Model">
+            <View style={styles.pickerWrap}>
+              <Picker selectedValue={profile.vehicle_model} onValueChange={(v) => setProfile({ ...profile, vehicle_model: v })} enabled={!!profile.vehicle_make && !modelsLoading} style={styles.picker}>
+                <Picker.Item label={modelsLoading ? 'Loading...' : 'Select model'} value="" />
+                {models.map((m) => <Picker.Item key={m} label={m} value={m} />)}
+              </Picker>
+            </View>
+          </Field>
+
+          <Field label="Trim">
+            {trims.length > 0 ? (
+              <View style={styles.pickerWrap}>
+                <Picker selectedValue={selectedTrimId} onValueChange={(v) => { setSelectedTrimId(v); const found = trims.find(t => t.value === v); setProfile((p: any) => ({ ...p, vehicle_trim: found?.text ?? '' })); }} style={styles.picker}>
+                  <Picker.Item label="Select trim" value="" />
+                  {trims.map((t) => <Picker.Item key={t.value} label={t.text} value={t.value} />)}
+                </Picker>
+              </View>
+            ) : (
+              <TextInput style={styles.input} value={profile.vehicle_trim} onChangeText={(t) => setProfile({ ...profile, vehicle_trim: t })} placeholder="Optional" placeholderTextColor="#bbb" />
+            )}
+          </Field>
+
+          <Field label="Tank size (L)">
+            <TextInput style={styles.input} keyboardType="numeric" value={profile.tank_size_l} onChangeText={(t) => setProfile({ ...profile, tank_size_l: t })} placeholder="e.g. 60" placeholderTextColor="#bbb" />
+          </Field>
 
           {profile.fuel_efficiency ? (
-            <View style={styles.infoBox}>
-              <Text style={styles.infoText}>Fuel efficiency: {profile.fuel_efficiency} L/100km</Text>
-              <Text style={styles.infoText}>Fuel type: {profile.fuel_type || 'Unknown'}</Text>
+            <View style={styles.infoRow}>
+              <Text style={styles.infoText}>{profile.fuel_efficiency} L/100km · {profile.fuel_type || 'Unknown fuel'}</Text>
             </View>
           ) : null}
 
           {lookupError && (
-            <TouchableOpacity style={styles.warningBox} onPress={() => setManualFuelMode(!manualFuelMode)}>
-              <Text style={styles.warningText}>Auto-lookup failed. Tap to enter manually.</Text>
+            <TouchableOpacity style={styles.warningRow} onPress={() => setManualFuelMode(!manualFuelMode)}>
+              <Text style={styles.warningText}>Auto-lookup failed — tap to enter manually</Text>
             </TouchableOpacity>
           )}
 
           {manualFuelMode && (
             <>
-              <Text style={styles.label}>Fuel Efficiency (L/100km)</Text>
-              <TextInput 
-                style={styles.input} 
-                keyboardType="numeric" 
-                value={profile.fuel_efficiency} 
-                onChangeText={(t) => setProfile({ ...profile, fuel_efficiency: t })} 
-                placeholder="e.g., 10.5"
-              />
-              <Text style={styles.label}>Fuel Type</Text>
-              <TextInput 
-                style={styles.input} 
-                value={profile.fuel_type} 
-                onChangeText={(t) => setProfile({ ...profile, fuel_type: t })}
-                placeholder="e.g., Regular"
-              />
+              <Field label="Fuel efficiency (L/100km)">
+                <TextInput style={styles.input} keyboardType="numeric" value={profile.fuel_efficiency} onChangeText={(t) => setProfile({ ...profile, fuel_efficiency: t })} placeholder="e.g. 10.5" placeholderTextColor="#bbb" />
+              </Field>
+              <Field label="Fuel type">
+                <TextInput style={styles.input} value={profile.fuel_type} onChangeText={(t) => setProfile({ ...profile, fuel_type: t })} placeholder="e.g. Regular" placeholderTextColor="#bbb" />
+              </Field>
             </>
           )}
-
-          <Text style={styles.label}>Tank Size (L)</Text>
-          <TextInput 
-            style={styles.input} 
-            keyboardType="numeric"
-            value={profile.tank_size_l} 
-            onChangeText={(t) => setProfile({ ...profile, tank_size_l: t })}
-            placeholder="e.g., 60"
-          />
         </View>
 
-        {/* Location Section */}
+        {/* Location */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Home Location</Text>
-          
-          <TouchableOpacity style={styles.locationButton} onPress={getLocation} disabled={locationLoading}>
-            {locationLoading ? (
-              <ActivityIndicator color="#fff" />
-            ) : (
-              <Text style={styles.locationButtonText}>
-                Find my location for me
-              </Text>
-            )}
-          </TouchableOpacity>
-          
+
           {profile.home_lat && profile.home_lng && (
-            <Text style={styles.coordsText}>
-              Current: {parseFloat(profile.home_lat).toFixed(4)}, {parseFloat(profile.home_lng).toFixed(4)}
-            </Text>
+            <View style={styles.coordsRow}>
+              <Text style={styles.coordsText}>{parseFloat(profile.home_lat).toFixed(4)}, {parseFloat(profile.home_lng).toFixed(4)}</Text>
+            </View>
           )}
-          
-          {locationFailed && (
-            <>
-              <Text style={styles.subLabel}>Or enter coordinates manually:</Text>
-              <View style={styles.row}>
-                <TextInput
-                  style={[styles.input, styles.halfInput]}
-                  placeholder="Latitude"
-                  keyboardType="decimal-pad"
-                  value={profile.home_lat}
-                  onChangeText={(t) => setProfile({ ...profile, home_lat: t })}
-                />
-                <TextInput
-                  style={[styles.input, styles.halfInput]}
-                  placeholder="Longitude"
-                  keyboardType="decimal-pad"
-                  value={profile.home_lng}
-                  onChangeText={(t) => setProfile({ ...profile, home_lng: t })}
-                />
-              </View>
-            </>
+
+          <TextInput
+            style={[styles.input, { marginBottom: 8 }]}
+            placeholder="Search your address..."
+            placeholderTextColor="#bbb"
+            value={addressInput}
+            onChangeText={onAddressChange}
+            autoCorrect={false}
+          />
+          {addressSuggestions.length > 0 && (
+            <View style={styles.suggestions}>
+              {addressSuggestions.map((item, i) => (
+                <TouchableOpacity key={i} style={[styles.suggestion, i < addressSuggestions.length - 1 && styles.suggestionBorder]} onPress={() => selectAddress(item)}>
+                  <Text style={styles.suggestionText} numberOfLines={2}>{item.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          )}
+
+          <TouchableOpacity style={styles.locBtn} onPress={getLocation} disabled={locationLoading}>
+            {locationLoading ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.locBtnText}>Or detect my location automatically</Text>}
+          </TouchableOpacity>
+
+          {locationFailed && locationError && (
+            <Text style={[styles.locErrorText, { marginTop: 6 }]}>{locationError}</Text>
           )}
         </View>
 
-        {/* Search Settings Section */}
+        {/* Search Settings */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Search Settings</Text>
 
-          <Text style={styles.label}>Search Radius (km)</Text>
-          <TextInput 
-            style={styles.input} 
-            keyboardType="numeric" 
-            value={profile.search_radius_km} 
-            onChangeText={(t) => setProfile({ ...profile, search_radius_km: t })}
-            placeholder="15"
-          />
-          <Text style={styles.helpText}>How far to search for gas stations</Text>
-
-          <Text style={styles.label}>Max Detour (km)</Text>
-          <TextInput 
-            style={styles.input} 
-            keyboardType="numeric" 
-            value={profile.max_detour_km} 
-            onChangeText={(t) => setProfile({ ...profile, max_detour_km: t })}
-            placeholder="5"
-          />
-          <Text style={styles.helpText}>Maximum extra distance you're willing to drive</Text>
-
-          <Text style={styles.label}>Minimum Savings ($)</Text>
-          <TextInput 
-            style={styles.input} 
-            keyboardType="numeric" 
-            value={profile.min_savings} 
-            onChangeText={(t) => setProfile({ ...profile, min_savings: t })}
-            placeholder="1.00"
-          />
-          <Text style={styles.helpText}>Only show "worth it" if savings exceed this amount</Text>
+          <SettingRow label="Search radius" unit="km" value={profile.search_radius_km} onChange={(t) => setProfile({ ...profile, search_radius_km: t })} placeholder="15" />
+          <SettingRow label="Max detour" unit="km" value={profile.max_detour_km} onChange={(t) => setProfile({ ...profile, max_detour_km: t })} placeholder="5" />
+          <SettingRow label="Min savings" unit="$" value={profile.min_savings} onChange={(t) => setProfile({ ...profile, min_savings: t })} placeholder="1.00" />
         </View>
 
-        {/* Save Buttons */}
-        <TouchableOpacity 
-          style={[styles.saveButton, saving && styles.saveButtonDisabled]} 
-          onPress={save} 
-          disabled={saving}
-        >
-          <Text style={styles.saveButtonText}>{saving ? 'Saving...' : 'Save Profile'}</Text>
-        </TouchableOpacity>
-        
-        <TouchableOpacity style={styles.cancelButton} onPress={() => router.back()}>
-          <Text style={styles.cancelButtonText}>Cancel</Text>
+        {/* Save */}
+        <TouchableOpacity style={[styles.saveBtn, saving && styles.saveBtnDisabled]} onPress={save} disabled={saving}>
+          <Text style={styles.saveBtnText}>{saving ? 'Saving...' : 'Save'}</Text>
         </TouchableOpacity>
 
         <View style={{ height: 40 }} />
@@ -652,185 +655,204 @@ export default function ProfileScreen() {
   );
 }
 
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <View style={styles.fieldRow}>
+      <Text style={styles.fieldLabel}>{label}</Text>
+      <View style={styles.fieldControl}>{children}</View>
+    </View>
+  );
+}
+
+function SettingRow({ label, unit, value, onChange, placeholder }: { label: string; unit: string; value: string; onChange: (t: string) => void; placeholder: string }) {
+  return (
+    <View style={[styles.fieldRow, styles.fieldRowBorder]}>
+      <Text style={styles.fieldLabel}>{label}</Text>
+      <View style={styles.settingInputWrap}>
+        <TextInput style={styles.settingInput} keyboardType="numeric" value={value} onChangeText={onChange} placeholder={placeholder} placeholderTextColor="#bbb" />
+        <Text style={styles.settingUnit}>{unit}</Text>
+      </View>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
-  scrollView: {
-    flex: 1,
-    backgroundColor: '#f5f5f5',
-  },
-  container: {
-    padding: 16,
-  },
-  centered: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: '#f5f5f5',
-  },
-  loadingText: {
-    marginTop: 12,
-    fontSize: 16,
-    color: '#666',
-  },
-  title: {
-    fontSize: 28,
-    fontWeight: 'bold',
+  scrollView: { flex: 1, backgroundColor: '#f2f2f7' },
+  scrollContent: { paddingBottom: 40 },
+  centered: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#f2f2f7' },
+
+  // Hero
+  hero: {
+    backgroundColor: '#1a1a2e',
+    paddingTop: 60,
+    paddingHorizontal: 20,
+    paddingBottom: 28,
+    borderBottomLeftRadius: 28,
+    borderBottomRightRadius: 28,
     marginBottom: 20,
-    marginTop: 40,
-    color: '#1a1a2e',
   },
-  section: {
-    backgroundColor: '#fff',
-    borderRadius: 12,
-    padding: 16,
+  backBtn: {
+    width: 36, height: 36, borderRadius: 18,
+    backgroundColor: 'rgba(255,255,255,0.12)',
+    justifyContent: 'center', alignItems: 'center',
     marginBottom: 16,
+  },
+  backBtnText: { fontSize: 24, color: '#fff', lineHeight: 28, marginTop: -2 },
+  heroTitle: { fontSize: 26, fontWeight: '700', color: '#fff' },
+  heroSub: { fontSize: 13, color: 'rgba(255,255,255,0.5)', marginTop: 4 },
+
+  // Banner
+  banner: {
+    marginHorizontal: 16,
+    marginBottom: 12,
+    backgroundColor: '#fff3e0',
+    borderRadius: 10,
+    padding: 12,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  bannerText: { fontSize: 13, color: '#e65100', flex: 1 },
+  bannerDismiss: { fontSize: 13, color: '#4285F4', fontWeight: '600', marginLeft: 8 },
+
+  // Section card
+  section: {
+    marginHorizontal: 16,
+    marginBottom: 14,
+    backgroundColor: '#fff',
+    borderRadius: 16,
+    paddingVertical: 4,
+    paddingHorizontal: 16,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.1,
-    shadowRadius: 2,
-    elevation: 2,
+    shadowOpacity: 0.05,
+    shadowRadius: 4,
+    elevation: 1,
   },
   sectionTitle: {
-    fontSize: 18,
+    fontSize: 11,
     fontWeight: '600',
-    marginBottom: 16,
-    color: '#333',
-  },
-  label: {
-    marginTop: 12,
-    marginBottom: 6,
-    color: '#333',
-    fontWeight: '500',
-    fontSize: 14,
-  },
-  subLabel: {
-    marginTop: 12,
-    marginBottom: 6,
-    color: '#666',
-    fontSize: 13,
-  },
-  helpText: {
     color: '#888',
-    fontSize: 12,
-    marginTop: 4,
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+    paddingTop: 14,
+    paddingBottom: 6,
   },
-  input: {
-    borderWidth: 1,
-    borderColor: '#ddd',
-    padding: 12,
-    borderRadius: 8,
-    fontSize: 16,
-    backgroundColor: '#fafafa',
+
+  // Field row
+  fieldRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: '#f0f0f0',
   },
-  pickerContainer: {
+  fieldRowBorder: {},
+  fieldLabel: { fontSize: 14, color: '#333', width: 110 },
+  fieldControl: { flex: 1 },
+
+  // Picker
+  pickerWrap: {
     borderWidth: 1,
-    borderColor: '#ddd',
+    borderColor: '#eee',
     borderRadius: 8,
     overflow: 'hidden',
     backgroundColor: '#fafafa',
   },
-  picker: {
-    height: 50,
-  },
-  row: {
-    flexDirection: 'row',
-    gap: 10,
-  },
-  halfInput: {
-    flex: 1,
-  },
-  infoBox: {
-    backgroundColor: '#e3f2fd',
-    padding: 12,
+  picker: { height: 44 },
+
+  // Text input
+  input: {
+    borderWidth: 1,
+    borderColor: '#eee',
     borderRadius: 8,
-    marginTop: 12,
-  },
-  infoText: {
-    color: '#1976d2',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
     fontSize: 14,
-    marginBottom: 4,
+    backgroundColor: '#fafafa',
+    color: '#1a1a2e',
   },
-  warningBox: {
-    backgroundColor: '#fff3e0',
-    padding: 12,
+
+  // Fuel info
+  infoRow: {
+    backgroundColor: '#e8f5e9',
     borderRadius: 8,
-    marginTop: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    marginVertical: 8,
   },
-  warningText: {
-    color: '#f57c00',
-    fontSize: 14,
-  },
-  errorBox: {
-    backgroundColor: '#ffebee',
-    padding: 16,
+  infoText: { fontSize: 13, color: '#2e7d32' },
+  warningRow: {
+    backgroundColor: '#fff8e1',
     borderRadius: 8,
-    marginBottom: 16,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    marginVertical: 8,
   },
-  errorText: {
-    color: '#c62828',
+  warningText: { fontSize: 13, color: '#f57c00' },
+
+  // Location
+  coordsRow: {
+    paddingVertical: 8,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: '#f0f0f0',
+  },
+  coordsText: { fontSize: 13, color: '#666' },
+  locBtn: {
+    backgroundColor: '#4285F4',
+    borderRadius: 10,
+    paddingVertical: 11,
+    alignItems: 'center',
+    marginVertical: 10,
+  },
+  locBtnText: { color: '#fff', fontSize: 14, fontWeight: '600' },
+  locFallback: { paddingBottom: 8 },
+  locErrorText: { fontSize: 12, color: '#e65100', marginBottom: 6 },
+  retryBtn: {
+    borderWidth: 1,
+    borderColor: '#4285F4',
+    borderRadius: 8,
+    paddingVertical: 8,
+    alignItems: 'center',
+  },
+  retryBtnText: { fontSize: 13, color: '#4285F4', fontWeight: '600' },
+  suggestions: {
+    marginTop: 4,
+    borderWidth: 1,
+    borderColor: '#eee',
+    borderRadius: 8,
+    backgroundColor: '#fff',
+    overflow: 'hidden',
+  },
+  suggestion: { padding: 11 },
+  suggestionBorder: { borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#eee' },
+  suggestionText: { fontSize: 13, color: '#333' },
+
+  // Setting row
+  settingInputWrap: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  settingInput: {
+    borderWidth: 1,
+    borderColor: '#eee',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
     fontSize: 14,
-    fontWeight: '600',
-    marginBottom: 4,
+    backgroundColor: '#fafafa',
+    color: '#1a1a2e',
+    width: 70,
+    textAlign: 'right',
   },
-  errorSubtext: {
-    color: '#d32f2f',
-    fontSize: 13,
+  settingUnit: { fontSize: 13, color: '#888' },
+
+  // Save
+  saveBtn: {
+    marginHorizontal: 16,
+    backgroundColor: '#4285F4',
+    borderRadius: 14,
+    paddingVertical: 15,
+    alignItems: 'center',
     marginTop: 4,
   },
-  dismissButton: {
-    marginTop: 10,
-    padding: 8,
-    backgroundColor: '#fff',
-    borderRadius: 6,
-    alignSelf: 'flex-start',
-  },
-  dismissButtonText: {
-    color: '#c62828',
-    fontSize: 13,
-    fontWeight: '600',
-  },
-  locationButton: {
-    backgroundColor: '#4285F4',
-    padding: 14,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  locationButtonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  coordsText: {
-    textAlign: 'center',
-    color: '#666',
-    fontSize: 13,
-    marginTop: 8,
-  },
-  saveButton: {
-    backgroundColor: '#4caf50',
-    padding: 16,
-    borderRadius: 8,
-    alignItems: 'center',
-    marginTop: 8,
-  },
-  saveButtonDisabled: {
-    backgroundColor: '#a5d6a7',
-  },
-  saveButtonText: {
-    color: '#fff',
-    fontSize: 18,
-    fontWeight: '600',
-  },
-  cancelButton: {
-    backgroundColor: '#fff',
-    padding: 14,
-    borderRadius: 8,
-    alignItems: 'center',
-    marginTop: 10,
-    borderWidth: 1,
-    borderColor: '#ddd',
-  },
-  cancelButtonText: {
-    color: '#666',
-    fontSize: 16,
-  },
+  saveBtnDisabled: { backgroundColor: '#a0bfee' },
+  saveBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
 });

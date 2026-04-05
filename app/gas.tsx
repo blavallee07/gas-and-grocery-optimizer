@@ -1,38 +1,25 @@
-import { Linking, Platform } from 'react-native';
 import { API_BASE } from '@/lib/config';
 import { supabase } from '@/lib/supabase';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Location from 'expo-location';
 import { useRouter } from 'expo-router';
-import { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Image, RefreshControl, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  Animated,
+  ActivityIndicator,
+  Image,
+  Linking,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+  useWindowDimensions,
+} from 'react-native';
 
-const fetchWithTimeout = async (url: string, options?: RequestInit, timeoutMs = 60000) => {
-  if (typeof AbortController === 'undefined') {
-    return fetch(url, options);
-  }
+// ─── Brand logos ──────────────────────────────────────────────────────────────
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(timeoutId);
-  }
-};
-
-const getFetchErrorMessage = (error: any) => {
-  const message = (error?.message || String(error || '')).toLowerCase();
-  if (error?.name === 'AbortError') {
-    return 'Request timed out. Please try again.';
-  }
-  if (message.includes('failed to fetch') || message.includes('network request failed')) {
-    return 'Unable to reach the gas server. Start the proxy server (npm run start-proxy) and try again.';
-  }
-  return error?.message || 'Failed to fetch gas stations.';
-};
-
-// Brand logos
 const BRAND_LOGOS: Record<string, string> = {
   'shell': 'https://logo.clearbit.com/shell.com',
   'esso': 'https://logo.clearbit.com/esso.com',
@@ -42,15 +29,37 @@ const BRAND_LOGOS: Record<string, string> = {
   'costco': 'https://logo.clearbit.com/costco.com',
   'mobil': 'https://logo.clearbit.com/mobil.com',
   'pioneer': 'https://logo.clearbit.com/pioneerpetroleum.ca',
+  '7-eleven': 'https://logo.clearbit.com/7eleven.com',
 };
 
-const getBrandLogo = (name: string): string | null => {
+const BRAND_COLORS: Record<string, string> = {
+  'shell': '#FBCE07',
+  'esso': '#003087',
+  'petro-canada': '#E4003A',
+  'ultramar': '#E4003A',
+  'canadian tire': '#CC0000',
+  'costco': '#005DAA',
+  '7-eleven': '#007140',
+  'pioneer': '#E55B00',
+};
+
+function getBrandLogo(name: string): string | null {
   const lower = name.toLowerCase();
   for (const [brand, url] of Object.entries(BRAND_LOGOS)) {
     if (lower.includes(brand)) return url;
   }
   return null;
-};
+}
+
+function getBrandColor(name: string): string {
+  const lower = name.toLowerCase();
+  for (const [brand, color] of Object.entries(BRAND_COLORS)) {
+    if (lower.includes(brand)) return color;
+  }
+  return '#4285F4';
+}
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface Station {
   id: string;
@@ -62,6 +71,8 @@ interface Station {
   distance_km: number;
   driving_distance_km?: number;
   driving_duration_min?: number;
+  price_updated_at?: string;
+  photo_url?: string | null;
 }
 
 interface StationResult extends Station {
@@ -70,43 +81,83 @@ interface StationResult extends Station {
   net_savings: number;
   worth_it: boolean;
   is_baseline: boolean;
+  sort_score: number;
 }
 
-type SortOption = 'price' | 'distance' | 'savings' | 'worthIt';
+const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const LOCATION_DRIFT_KM = 5; // update profile if moved more than this
 
-const SORT_OPTIONS: { key: SortOption; label: string }[] = [
-  { key: 'savings', label: 'Most Savings' },
-  { key: 'price', label: 'Lowest Price' },
-  { key: 'distance', label: 'Closest' },
-];
+function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// ─── Bouncing dots loader ─────────────────────────────────────────────────────
+
+function BouncingDots() {
+  const dots = [useRef(new Animated.Value(0)).current, useRef(new Animated.Value(0)).current, useRef(new Animated.Value(0)).current];
+
+  useEffect(() => {
+    const animations = dots.map((dot, i) =>
+      Animated.loop(
+        Animated.sequence([
+          Animated.delay(i * 150),
+          Animated.timing(dot, { toValue: -10, duration: 300, useNativeDriver: true }),
+          Animated.timing(dot, { toValue: 0, duration: 300, useNativeDriver: true }),
+          Animated.delay((dots.length - i - 1) * 150),
+        ])
+      )
+    );
+    animations.forEach(a => a.start());
+    return () => animations.forEach(a => a.stop());
+  }, []);
+
+  return (
+    <View style={dotStyles.row}>
+      {dots.map((dot, i) => (
+        <Animated.View key={i} style={[dotStyles.dot, { transform: [{ translateY: dot }] }]} />
+      ))}
+    </View>
+  );
+}
+
+const dotStyles = StyleSheet.create({
+  row: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  dot: { width: 12, height: 12, borderRadius: 6, backgroundColor: '#4285F4' },
+});
+
+// ─── Component ────────────────────────────────────────────────────────────────
 
 export default function GasScreen() {
   const router = useRouter();
+  const { width } = useWindowDimensions();
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [reloading, setReloading] = useState(false);
   const [stations, setStations] = useState<StationResult[]>([]);
   const [profile, setProfile] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [sortBy, setSortBy] = useState<SortOption>('savings');
+  const [currentCoords, setCurrentCoords] = useState<{ lat: number; lng: number } | null>(null);
+  const [currentAddress, setCurrentAddress] = useState<string | null>(null);
+  const [userInitial, setUserInitial] = useState('?');
 
-  // Open Google Maps with directions to the station
-  const openNavigationToStation = (station: Station) => {
-    const destinationLat = station.lat;
-    const destinationLng = station.lng;
-    
-    let url: string;
-    
-    // If we have origin coordinates, add them
-    if (profile?.home_lat && profile?.home_lng) {
-      url = `https://www.google.com/maps/dir/?api=1&origin=${profile.home_lat},${profile.home_lng}&destination=${destinationLat},${destinationLng}&travelmode=driving`;
-    } else {
-      url = `https://www.google.com/maps/dir/?api=1&destination=${destinationLat},${destinationLng}&travelmode=driving`;
-    }
-    
-    Linking.openURL(url).catch(err => {
-      console.error('Failed to open maps:', err);
-    });
+  // Responsive grid: 2 cols on mobile, 3 on tablet, 4 on desktop
+  const numCols = width >= 1024 ? 4 : width >= 680 ? 3 : 2;
+  const cardWidth = (width - 24 - (numCols - 1) * 12) / numCols;
+
+  const openDirections = (station: Station) => {
+    const dest = `${station.lat},${station.lng}`;
+    const origin = profile?.home_lat && profile?.home_lng
+      ? `&origin=${profile.home_lat},${profile.home_lng}`
+      : '';
+    Linking.openURL(
+      `https://www.google.com/maps/dir/?api=1${origin}&destination=${dest}&travelmode=driving`
+    ).catch(() => {});
   };
 
   useEffect(() => {
@@ -116,13 +167,10 @@ export default function GasScreen() {
   const loadData = async (forceRefresh = false) => {
     if (!forceRefresh) setLoading(true);
     setError(null);
-    
+
     try {
       const { data: { session } } = await supabase.auth.getSession();
-      if (!session?.user) {
-        router.replace('/login');
-        return;
-      }
+      if (!session?.user) { router.replace('/login'); return; }
 
       const { data: profileData, error: profileError } = await supabase
         .from('profiles')
@@ -131,180 +179,195 @@ export default function GasScreen() {
         .maybeSingle();
 
       if (profileError) throw profileError;
-      if (!profileData?.home_lat || !profileData?.home_lng) {
-        setError('Please set your home location in Profile first.');
-        setLoading(false);
-        setRefreshing(false);
-        return;
-      }
-
-      if (!profileData?.vehicle_year || !profileData?.vehicle_make || !profileData?.vehicle_model || !profileData?.vehicle_trim) {
-        setError('Please complete your vehicle year, make, model, and trim in Profile first.');
-        setLoading(false);
-        setRefreshing(false);
-        return;
-      }
 
       setProfile(profileData);
 
-      const cacheKey = `gas_stations_${profileData.home_lat}_${profileData.home_lng}`;
-      
+      // Set avatar initial from session email
+      const email = session.user.email || '';
+      const name = profileData?.full_name || email;
+      setUserInitial((name).charAt(0).toUpperCase() || '?');
+
+      // ── Auto GPS location ─────────────────────────────────────────────────
+      let lat: number = profileData?.home_lat;
+      let lng: number = profileData?.home_lng;
+
+      const getGpsCoords = async (): Promise<{ latitude: number; longitude: number }> => {
+        if (typeof window !== 'undefined' && window.navigator?.geolocation) {
+          // Try browser geolocation, fall back to IP-based
+          const browserPos = await new Promise<{ latitude: number; longitude: number } | null>((resolve) => {
+            window.navigator.geolocation.getCurrentPosition(
+              (pos) => resolve({ latitude: pos.coords.latitude, longitude: pos.coords.longitude }),
+              () => resolve(null),
+              { timeout: 10000, enableHighAccuracy: true }
+            );
+          });
+          if (browserPos) return browserPos;
+
+          const res = await fetch('https://ipapi.co/json/');
+          const data = await res.json();
+          if (!data.latitude || !data.longitude) throw new Error('IP geolocation failed');
+          return { latitude: data.latitude, longitude: data.longitude };
+        }
+        // Native: use expo-location
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') throw new Error('Permission denied');
+        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+        return { latitude: pos.coords.latitude, longitude: pos.coords.longitude };
+      };
+
+      try {
+        const { latitude: gpsLat, longitude: gpsLng } = await getGpsCoords();
+
+        const hasStored = profileData?.home_lat && profileData?.home_lng;
+        const distFromStored = hasStored
+          ? haversineKm(profileData.home_lat, profileData.home_lng, gpsLat, gpsLng)
+          : 0;
+
+        // If GPS is more than 100km from the stored location, it's almost certainly
+        // an IP-based fallback returning the wrong city — ignore it.
+        const gpsSeemsTrustworthy = !hasStored || distFromStored < 100;
+
+        if (gpsSeemsTrustworthy) {
+          // Silently update stored location only for genuine small drift
+          if (hasStored && distFromStored > LOCATION_DRIFT_KM) {
+            supabase.from('profiles')
+              .update({ home_lat: gpsLat, home_lng: gpsLng })
+              .eq('id', session.user.id)
+              .then(() => {});
+          }
+          lat = gpsLat;
+          lng = gpsLng;
+        } else {
+          console.warn(`GPS returned location ${distFromStored.toFixed(0)}km from stored — likely IP fallback, ignoring.`);
+        }
+      } catch (e) {
+        console.warn('GPS unavailable, falling back to stored location:', e);
+      }
+
+      if (!lat || !lng) {
+        setError('Could not determine your location. Please set it in Profile.');
+        return;
+      }
+
+      setCurrentCoords({ lat, lng });
+
+      // Reverse geocode to show a readable address instead of raw coords
+      fetch(`https://photon.komoot.io/reverse?lat=${lat}&lon=${lng}&limit=1`)
+        .then(r => r.json())
+        .then(d => {
+          const p = d.features?.[0]?.properties || {};
+          const parts = [p.street, p.city || p.town || p.village, p.county].filter(Boolean);
+          if (parts.length) setCurrentAddress(parts.join(', '));
+        })
+        .catch(() => {});
+
+      const cacheKey = `gas_v2_${lat.toFixed(3)}_${lng.toFixed(3)}`;
+
+      // Return cached results if fresh and not forcing refresh
       if (!forceRefresh) {
         try {
           const cached = await AsyncStorage.getItem(cacheKey);
           if (cached) {
             const { stations: cachedStations, timestamp } = JSON.parse(cached);
-            const age = Date.now() - timestamp;
-            if (age < 30 * 60 * 1000) {
-              const results = rankStations(cachedStations, profileData);
-              setStations(results);
+            if (Date.now() - timestamp < CACHE_TTL_MS) {
+              setStations(rankStations(cachedStations, profileData));
               setLastUpdated(new Date(timestamp));
-              setLoading(false);
-              setRefreshing(false);
               return;
             }
           }
-        } catch (e) {
-          console.warn('Cache read error:', e);
-        }
+        } catch {}
       }
 
-      const radius = profileData.search_radius_km || 15;
-      const url = `${API_BASE}/gasbuddy/smart?lat=${profileData.home_lat}&lng=${profileData.home_lng}&radius=${radius}`;
-      
-      console.log('Fetching Ontario gas stations from:', url);
-      
-      const response = await fetchWithTimeout(url, undefined, 60000);
-      
-      if (!response.ok) {
-        console.error('HTTP error:', response.status, response.statusText);
-        if (response.status === 0 || !response.status) {
-          throw new Error('Cannot connect to server. Make sure the proxy server is running: cd server && node proxy.js');
-        }
-        throw new Error(`Server error: ${response.status} ${response.statusText}`);
-      }
-      
+      const radius = profileData?.search_radius_km || 15;
+      const url = `${API_BASE}/stations/nearby?lat=${lat}&lng=${lng}&radius=${radius}`;
+
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`Server error ${response.status}`);
+
       const data = await response.json();
-      console.log('Received data:', data.success, 'stations:', data.stations?.length || 0);
+      if (!data.success) throw new Error(data.error || 'Failed to load stations');
 
-      if (!data.success) throw new Error(data.error || 'Failed to fetch stations');
-      
-      if (!data.stations || data.stations.length === 0) {
-        throw new Error('No gas stations found in your area. The proxy server may be having issues scraping GasBuddy. Try increasing your search radius or check the server logs.');
+      if (!data.stations?.length) {
+        setError('No gas stations found within your search radius. Try increasing it in Profile.');
+        return;
       }
 
       const now = Date.now();
-      try {
-        await AsyncStorage.setItem(cacheKey, JSON.stringify({
-          stations: data.stations,
-          timestamp: now,
-        }));
-      } catch (e) {
-        console.warn('Cache write error:', e);
-      }
+      await AsyncStorage.setItem(cacheKey, JSON.stringify({ stations: data.stations, timestamp: now })).catch(() => {});
 
-      const results = rankStations(data.stations, profileData);
-      setStations(results);
+      setStations(rankStations(data.stations, profileData));
       setLastUpdated(new Date(now));
-
     } catch (e: any) {
       console.error('Load error:', e);
-      setError(getFetchErrorMessage(e));
+      setError(e?.message || 'Failed to load gas stations.');
     } finally {
       setLoading(false);
       setRefreshing(false);
+      setReloading(false);
     }
   };
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
+    setReloading(true);
+    setStations([]);
     loadData(true);
-  }, []);
+  }, [profile]);
 
-  const rankStations = (stations: Station[], profile: any): StationResult[] => {
-    const withPrices = stations.filter(s => s.price_per_l !== null);
-    if (withPrices.length === 0) return [];
+  const rankStations = (rawStations: Station[], prof: any): StationResult[] => {
+    const withPrices = rawStations.filter(s => s.price_per_l !== null);
+    if (!withPrices.length) return [];
 
-    const baseline = withPrices.reduce((min, s) => 
-      (s.driving_distance_km || s.distance_km) < (min.driving_distance_km || min.distance_km) ? s : min
+    // Use driving distance when available; otherwise estimate from straight-line with road factor.
+    // This keeps detour cost calculations consistent across all stations.
+    const ROAD_FACTOR = 1.35;
+    const effectiveDist = (s: Station) =>
+      s.driving_distance_km ?? s.distance_km * ROAD_FACTOR;
+
+    const baseline = withPrices.reduce((min, s) =>
+      effectiveDist(s) < effectiveDist(min) ? s : min
     );
     const baselinePrice = baseline.price_per_l!;
-    const baselineDistance = baseline.driving_distance_km || baseline.distance_km;
+    const baselineDist = effectiveDist(baseline);
 
-    const tankSize = profile.tank_size_l || 50;
-    const efficiency = profile.fuel_efficiency || 10;
-    const minSavings = profile.min_savings || 1;
-    const fillAmount = 0.75;
+    const tankSize = prof.tank_size_l || 50;
+    const efficiency = prof.fuel_efficiency || 10;
+    const minSavings = prof.min_savings || 1;
+    const litersToFill = tankSize * 0.75;
 
-    const litersToFill = tankSize * fillAmount;
+    return withPrices.map(station => {
+      const stationDist = effectiveDist(station);
+      const detourKm = Math.max(0, (stationDist - baselineDist) * 2);
+      const priceDiff = baselinePrice - station.price_per_l!;
+      const grossSavings = priceDiff * litersToFill;
+      const detourCost = (detourKm / 100) * efficiency * baselinePrice;
+      const netSavings = grossSavings - detourCost;
 
-    const results = withPrices
-      .map(station => {
-        const stationDistance = station.driving_distance_km || station.distance_km;
-        const detourKm = Math.max(0, (stationDistance - baselineDistance) * 2);
-
-        const priceDiff = baselinePrice - station.price_per_l!;
-        const grossSavings = priceDiff * litersToFill;
-
-        const fuelUsed = (detourKm / 100) * efficiency;
-        const detourCost = fuelUsed * baselinePrice;
-
-        const netSavings = grossSavings - detourCost;
-        const isBaseline = station.id === baseline.id;
-
-        return {
-          ...station,
-          gross_savings: Math.round(grossSavings * 100) / 100,
-          detour_cost: Math.round(detourCost * 100) / 100,
-          net_savings: Math.round(netSavings * 100) / 100,
-          worth_it: netSavings >= minSavings,
-          is_baseline: isBaseline,
-        };
-      })
-      .sort((a, b) => (a.price_per_l || 999) - (b.price_per_l || 999));
-
-    return results;
+      return {
+        ...station,
+        gross_savings: Math.round(grossSavings * 100) / 100,
+        detour_cost: Math.round(detourCost * 100) / 100,
+        net_savings: Math.round(netSavings * 100) / 100,
+        worth_it: netSavings >= minSavings,
+        is_baseline: station.id === baseline.id,
+        sort_score: 0,
+      };
+    }).sort((a, b) => b.net_savings - a.net_savings);
   };
 
-  const formatTime = (date: Date): string => {
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const formatAge = (date: Date): string => {
+    const mins = Math.round((Date.now() - date.getTime()) / 60000);
+    if (mins < 1) return 'just now';
+    if (mins === 1) return '1 min ago';
+    return `${mins} min ago`;
   };
 
-  const getSortedStations = (stations: StationResult[]): StationResult[] => {
-    const sorted = [...stations];
-    switch (sortBy) {
-      case 'price':
-        return sorted.sort((a, b) => (a.price_per_l || 999) - (b.price_per_l || 999));
-      case 'distance':
-        return sorted.sort((a, b) => {
-          const distA = a.driving_distance_km || a.distance_km;
-          const distB = b.driving_distance_km || b.distance_km;
-          return distA - distB;
-        });
-      case 'savings':
-        return sorted.sort((a, b) => b.net_savings - a.net_savings);
-      case 'worthIt':
-        return sorted.sort((a, b) => {
-          if (a.worth_it && !b.worth_it) return -1;
-          if (!a.worth_it && b.worth_it) return 1;
-          if (a.worth_it && b.worth_it) return b.net_savings - a.net_savings;
-          return (a.price_per_l || 999) - (b.price_per_l || 999);
-        });
-      default:
-        return sorted;
-    }
-  };
-
-  const setSortOption = (option: SortOption) => {
-    setSortBy(option);
-  };
+  // ─── States ────────────────────────────────────────────────────────────────
 
   if (loading) {
     return (
       <View style={styles.centered}>
-        <ActivityIndicator size="large" color="#4285F4" />
-        <Text style={styles.loadingText}>Finding best gas prices...</Text>
-        <Text style={styles.loadingSubtext}>This may take a moment</Text>
+        <BouncingDots />
       </View>
     );
   }
@@ -312,625 +375,297 @@ export default function GasScreen() {
   if (error) {
     return (
       <View style={styles.centered}>
-        <Text style={styles.errorEmoji}>⚠️</Text>
+        <Text style={styles.errorEmoji}>!</Text>
         <Text style={styles.errorText}>{error}</Text>
-        <TouchableOpacity style={styles.primaryButton} onPress={() => router.push('/profile')}>
-          <Text style={styles.primaryButtonText}>Go to Profile</Text>
+        <TouchableOpacity style={styles.btn} onPress={() => loadData(true)}>
+          <Text style={styles.btnText}>Try Again</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={[styles.btn, styles.btnSecondary]} onPress={() => router.push('/profile')}>
+          <Text style={styles.btnSecondaryText}>Go to Profile</Text>
         </TouchableOpacity>
       </View>
     );
   }
 
-  const sortedStations = getSortedStations(stations);
-  const displayStations = sortedStations;
-  const cheapestStation = [...stations].sort((a, b) => (a.price_per_l || 999) - (b.price_per_l || 999))[0];
-  const bestSavingsStation = [...displayStations]
-    .filter(s => s.net_savings > 0)
-    .sort((a, b) => b.net_savings - a.net_savings)[0];
+  // ─── Grid ──────────────────────────────────────────────────────────────────
 
   return (
-    <ScrollView 
+    <ScrollView
       style={styles.container}
-      refreshControl={
-        <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
-      }
+      contentContainerStyle={styles.scrollContent}
     >
+      {/* Header */}
       <View style={styles.header}>
-        <Text style={styles.title}>Gas Stations</Text>
-        {lastUpdated && (
-          <Text style={styles.lastUpdated}>Updated {formatTime(lastUpdated)}</Text>
-        )}
-      </View>
-
-      {/* Tap hint */}
-      <Text style={styles.tapHint}>Tap any station to get directions</Text>
-
-      {/* Cheapest Price Card */}
-      {cheapestStation && (
-        <TouchableOpacity 
-          style={styles.cheapestCard}
-          onPress={() => openNavigationToStation(cheapestStation)}
-          activeOpacity={0.7}
-        >
-          <View style={styles.cheapestBadge}>
-            <Text style={styles.cheapestBadgeText}>CHEAPEST</Text>
-          </View>
-          <View style={styles.stationRow}>
-            {getBrandLogo(cheapestStation.name) && (
-              <Image source={{ uri: getBrandLogo(cheapestStation.name)! }} style={styles.logoSmall} />
-            )}
-            <View style={styles.stationInfo}>
-              <Text style={styles.stationName}>{cheapestStation.name}</Text>
-              <Text style={styles.stationDistance}>
-                {cheapestStation.driving_distance_km?.toFixed(1) || cheapestStation.distance_km.toFixed(1)} km
-                {cheapestStation.driving_duration_min && ` • ${cheapestStation.driving_duration_min} min`}
+        <View style={styles.headerLeft}>
+          <TouchableOpacity style={styles.backBtn} onPress={() => router.push('/')}>
+            <Text style={styles.backBtnText}>‹</Text>
+          </TouchableOpacity>
+          <View>
+            <Text style={styles.title}>Gas Stations</Text>
+            {(currentAddress || currentCoords) && (
+              <Text style={styles.subtitle}>
+                {currentAddress ?? `${currentCoords!.lat.toFixed(3)}, ${currentCoords!.lng.toFixed(3)}`}
+                {lastUpdated ? ` · ${formatAge(lastUpdated)}` : ''}
               </Text>
-            </View>
-            <View style={styles.priceContainer}>
-              <Text style={styles.cheapestPrice}>${cheapestStation.price_per_l?.toFixed(3)}</Text>
-              <Text style={styles.perLiterSmall}>/L</Text>
-            </View>
+            )}
           </View>
-          {cheapestStation.net_savings < 0 && (
-            <Text style={styles.notWorthIt}>
-              Not worth the detour (${Math.abs(cheapestStation.net_savings).toFixed(2)} loss)
-            </Text>
-          )}
-        </TouchableOpacity>
-      )}
-
-      {/* Most Savings */}
-      {bestSavingsStation && bestSavingsStation.id !== cheapestStation?.id && (
-        <TouchableOpacity 
-          style={styles.cheapestCard}
-          onPress={() => openNavigationToStation(bestSavingsStation)}
-          activeOpacity={0.7}
-        >
-          <View style={[styles.cheapestBadge, { backgroundColor: '#4caf50' }]}>
-            <Text style={styles.cheapestBadgeText}>BEST SAVINGS</Text>
-          </View>
-          <View style={styles.stationRow}>
-            {getBrandLogo(bestSavingsStation.name) ? (
-              <Image source={{ uri: getBrandLogo(bestSavingsStation.name)! }} style={styles.logoSmall} />
+        </View>
+        <View style={styles.headerRight}>
+          <TouchableOpacity style={styles.refreshBtn} onPress={onRefresh} disabled={refreshing}>
+            <Text style={styles.refreshBtnText}>{refreshing ? '...' : '↻ Refresh'}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => router.push('/profile')} style={styles.avatarBtn}>
+            {profile?.avatar_url ? (
+              <Image source={{ uri: profile.avatar_url }} style={styles.avatar} />
             ) : (
-              <View style={styles.logoPlaceholder}>
-                <Text style={styles.logoPlaceholderText}>{bestSavingsStation.name.charAt(0)}</Text>
+              <View style={styles.avatarFallback}>
+                <Text style={styles.avatarLetter}>{userInitial}</Text>
               </View>
             )}
-            <View style={styles.stationInfo}>
-              <Text style={styles.stationName}>{bestSavingsStation.name}</Text>
-              <Text style={styles.stationDistance}>
-                {bestSavingsStation.driving_distance_km?.toFixed(1) || bestSavingsStation.distance_km.toFixed(1)} km
-                {bestSavingsStation.driving_duration_min && ` • ${bestSavingsStation.driving_duration_min} min`}
-              </Text>
-            </View>
-            <View style={styles.priceContainer}>
-              <Text style={[styles.stationPrice, styles.lowestPrice]}>
-                ${bestSavingsStation.price_per_l?.toFixed(3)}
-              </Text>
-              <Text style={styles.perLiterSmall}>/L</Text>
-            </View>
-          </View>
-          <View style={styles.savingsRow}>
-            <Text style={styles.savingsPositive}>+${bestSavingsStation.net_savings.toFixed(2)} net savings</Text>
-          </View>
-        </TouchableOpacity>
-      )}
-
-      {/* Sort Controls */}
-      <View style={styles.sortContainer}>
-        <Text style={styles.sectionTitle}>All Stations</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
-      {displayStations.length > 0 && (
-        <View style={styles.sortOptionsRow}>
-          {SORT_OPTIONS.map(option => (
-            <TouchableOpacity
-              key={option.key}
-              style={[
-                styles.sortOption,
-                sortBy === option.key && styles.sortOptionActive,
-              ]}
-              onPress={() => setSortOption(option.key)}
-            >
-              <Text
-                style={[
-                  styles.sortOptionText,
-                  sortBy === option.key && styles.sortOptionTextActive,
-                ]}
-              >
-                {option.label}
-              </Text>
-            </TouchableOpacity>
+      {/* Card grid or loading animation */}
+      {reloading ? (
+        <View style={styles.dotsContainer}>
+          <BouncingDots />
+        </View>
+      ) : (
+        <View style={styles.grid}>
+          {stations.map((station, index) => (
+            <StationCard
+              key={station.id}
+              station={station}
+              cardWidth={index === 0 ? width - 24 : cardWidth}
+              featured={index === 0}
+              onPress={() => openDirections(station)}
+            />
           ))}
         </View>
       )}
-      
-      {displayStations.map((station) => (
-        <TouchableOpacity 
-          key={station.id} 
-          style={[
-            styles.stationCard,
-            station.is_baseline && styles.baselineCard,
-            station.worth_it && station.net_savings > 0 && styles.worthItCard,
-            bestSavingsStation && station.id === bestSavingsStation.id && styles.bestSavingsCard,
-          ]}
-          onPress={() => openNavigationToStation(station)}
-          activeOpacity={0.7}
-        >
-          {/* Header Row */}
-          <View style={styles.cardHeader}>
-            <View style={styles.cardHeaderLeft}>
-              {getBrandLogo(station.name) ? (
-                <Image source={{ uri: getBrandLogo(station.name)! }} style={styles.logoCard} />
-              ) : (
-                <View style={styles.logoPlaceholderCard}>
-                  <Text style={styles.logoPlaceholderText}>{station.name.charAt(0)}</Text>
-                </View>
-              )}
-              <View style={styles.cardHeaderInfo}>
-                <Text style={styles.cardStationName} numberOfLines={1}>{station.name}</Text>
-                {station.is_baseline && (
-                  <View style={styles.inlineBadge}>
-                    <Text style={styles.inlineBadgeText}>📍 Closest</Text>
-                  </View>
-                )}
-                {bestSavingsStation && station.id === bestSavingsStation.id && (
-                  <View style={styles.bestSavingsBadge}>
-                    <Text style={styles.bestSavingsBadgeText}>💰 Best Savings</Text>
-                  </View>
-                )}
-              </View>
-            </View>
-            <View style={styles.cardPriceMain}>
-              <Text style={[
-                styles.cardPrice,
-                bestSavingsStation && station.id === bestSavingsStation.id && styles.cardPriceCheapest,
-              ]}>
-                ${station.price_per_l?.toFixed(3)}
-              </Text>
-              <Text style={styles.cardPerLiter}>/L</Text>
-            </View>
-          </View>
-
-          {/* Details Row */}
-          <View style={styles.cardDetails}>
-            <View style={styles.detailItem}>
-              <Text style={styles.detailLabel}>Distance</Text>
-              <Text style={styles.detailValue}>
-                {station.driving_distance_km?.toFixed(1) || station.distance_km.toFixed(1)} km
-              </Text>
-            </View>
-            {station.driving_duration_min && (
-              <View style={styles.detailItem}>
-                <Text style={styles.detailLabel}>Drive Time</Text>
-                <Text style={styles.detailValue}>{station.driving_duration_min} min</Text>
-              </View>
-            )}
-            <View style={styles.detailItem}>
-              <Text style={styles.detailLabel}>Savings</Text>
-              <Text style={[
-                styles.detailValue, 
-                station.net_savings > 0 ? styles.savingsPositiveText : station.net_savings < 0 ? styles.savingsNegativeText : styles.savingsNeutralText
-              ]}>
-                {station.net_savings > 0 ? '+' : ''}${station.net_savings.toFixed(2)}
-              </Text>
-            </View>
-          </View>
-
-          {/* Status Badge */}
-          {station.worth_it && station.net_savings > 0 && (
-            <View style={styles.worthItBanner}>
-              <Text style={styles.worthItBannerText}>✓ Worth the trip • Save ${station.net_savings.toFixed(2)}</Text>
-            </View>
-          )}
-          {station.net_savings < 0 && !station.is_baseline && (
-            <View style={styles.notWorthItBanner}>
-              <Text style={styles.notWorthItBannerText}>✗ ${Math.abs(station.net_savings).toFixed(2)} net loss</Text>
-            </View>
-          )}
-          
-          {/* Tap indicator */}
-          <View style={styles.tapIndicator}>
-            <Text style={styles.tapIndicatorText}>Tap for directions →</Text>
-          </View>
-        </TouchableOpacity>
-      ))}
-
-      <TouchableOpacity style={styles.refreshButton} onPress={onRefresh} disabled={refreshing}>
-        <Text style={styles.refreshText}>
-          {refreshing ? '🔄 Refreshing...' : '🔄 Refresh Prices'}
-        </Text>
-      </TouchableOpacity>
 
       <View style={{ height: 40 }} />
     </ScrollView>
   );
 }
 
+// ─── Station card ─────────────────────────────────────────────────────────────
+
+function StationCard({
+  station,
+  cardWidth,
+  featured = false,
+  onPress,
+}: {
+  station: StationResult;
+  cardWidth: number;
+  featured?: boolean;
+  onPress: () => void;
+}) {
+  const logoUrl = getBrandLogo(station.name);
+  const brandColor = getBrandColor(station.name);
+  const dist = (station.driving_distance_km || station.distance_km).toFixed(1);
+
+  return (
+    <TouchableOpacity
+      style={[styles.card, { width: cardWidth }, featured && styles.cardFeatured]}
+      onPress={onPress}
+      activeOpacity={0.85}
+    >
+      {/* Brand header */}
+      <View style={[styles.cardHeader, featured && styles.cardHeaderFeatured, { backgroundColor: brandColor }]}>
+        {station.photo_url ? (
+          <Image source={{ uri: station.photo_url }} style={styles.cardPhoto} resizeMode="cover" />
+        ) : logoUrl ? (
+          <Image source={{ uri: logoUrl }} style={styles.cardHeaderLogo} resizeMode="contain" />
+        ) : (
+          <Text style={styles.cardHeaderInitial}>{station.name.charAt(0)}</Text>
+        )}
+
+        {featured && (
+          <View style={[styles.worthBadge, styles.featuredBadge]}>
+            <Text style={styles.worthBadgeText}>Best Value</Text>
+          </View>
+        )}
+        {!featured && station.is_baseline && (
+          <View style={[styles.worthBadge, styles.closestBadge]}>
+            <Text style={styles.worthBadgeText}>Closest</Text>
+          </View>
+        )}
+      </View>
+
+      {/* Info */}
+      <View style={styles.cardBody}>
+        <Text style={[styles.cardName, featured && styles.cardNameFeatured]} numberOfLines={1}>{station.name}</Text>
+        <Text style={[styles.cardPrice, featured && styles.cardPriceFeatured]}>
+          {station.price_per_l !== null ? `$${station.price_per_l.toFixed(3)}/L` : 'No price'}
+        </Text>
+        <View style={styles.cardMeta}>
+          <Text style={styles.cardDist}>{dist} km</Text>
+          {station.driving_duration_min ? (
+            <Text style={styles.cardTime}> · {station.driving_duration_min} min</Text>
+          ) : null}
+        </View>
+        {station.net_savings !== 0 && (
+          <Text style={[
+            styles.cardSavings,
+            featured && styles.cardSavingsFeatured,
+            station.net_savings > 0 ? styles.savingsPos : styles.savingsNeg,
+          ]}>
+            {station.net_savings > 0
+              ? `Save $${station.net_savings.toFixed(2)}`
+              : `$${Math.abs(station.net_savings).toFixed(2)} net loss`}
+          </Text>
+        )}
+      </View>
+    </TouchableOpacity>
+  );
+}
+
+// ─── Styles ───────────────────────────────────────────────────────────────────
+
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#f5f5f5',
-  },
+  container: { flex: 1, backgroundColor: '#f2f2f7' },
+  scrollContent: { paddingBottom: 20 },
+  dotsContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingTop: 120 },
   centered: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    padding: 20,
-    backgroundColor: '#f5f5f5',
+    padding: 24,
+    backgroundColor: '#f2f2f7',
+    gap: 12,
   },
-  loadingText: {
-    marginTop: 16,
-    fontSize: 18,
-    fontWeight: '600',
-    color: '#333',
-  },
-  loadingSubtext: {
+  loadingText: { fontSize: 16, color: '#555', marginTop: 12 },
+  errorEmoji: { fontSize: 52, marginBottom: 8 },
+  errorText: { fontSize: 15, color: '#444', textAlign: 'center', lineHeight: 22 },
+  btn: {
+    backgroundColor: '#4285F4',
+    paddingVertical: 12,
+    paddingHorizontal: 28,
+    borderRadius: 10,
     marginTop: 4,
-    fontSize: 14,
-    color: '#666',
   },
-  errorEmoji: {
-    fontSize: 48,
-    marginBottom: 16,
-  },
-  errorText: {
-    fontSize: 16,
-    color: '#e74c3c',
-    textAlign: 'center',
-    marginBottom: 20,
-  },
+  btnText: { color: '#fff', fontWeight: '600', fontSize: 15 },
+  btnSecondary: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#ddd' },
+  btnSecondaryText: { color: '#444', fontWeight: '600', fontSize: 15 },
+
+  // Header
   header: {
     flexDirection: 'row',
     justifyContent: 'space-between',
+    alignItems: 'flex-end',
+    paddingHorizontal: 12,
+    paddingTop: 52,
+    paddingBottom: 16,
+  },
+  title: { fontSize: 26, fontWeight: '700', color: '#1a1a2e' },
+  subtitle: { fontSize: 12, color: '#888', marginTop: 2 },
+  headerLeft: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  headerRight: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  backBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#ddd',
+    justifyContent: 'center',
     alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingTop: 50,
-    paddingBottom: 8,
   },
-  title: {
-    fontSize: 28,
-    fontWeight: 'bold',
-    color: '#1a1a2e',
-  },
-  lastUpdated: {
-    fontSize: 12,
-    color: '#888',
-  },
-  tapHint: {
-    fontSize: 13,
-    color: '#666',
-    textAlign: 'center',
-    marginBottom: 12,
-    fontStyle: 'italic',
-  },
-  sortContainer: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginHorizontal: 16,
-    marginTop: 20,
-    marginBottom: 12,
-  },
-  sectionTitle: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#666',
-    flex: 1,
-  },
-  sortOptionsRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-    marginHorizontal: 16,
-    marginBottom: 12,
-  },
-  sortOption: {
+  backBtnText: { fontSize: 24, color: '#4285F4', lineHeight: 28, marginTop: -2 },
+  refreshBtn: {
     backgroundColor: '#fff',
     paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 999,
+    paddingHorizontal: 14,
+    borderRadius: 20,
     borderWidth: 1,
     borderColor: '#ddd',
   },
-  sortOptionActive: {
+  refreshBtnText: { fontSize: 13, fontWeight: '600', color: '#4285F4' },
+  avatarBtn: { width: 36, height: 36, borderRadius: 18, overflow: 'hidden' },
+  avatar: { width: 36, height: 36, borderRadius: 18 },
+  avatarFallback: {
+    width: 36, height: 36, borderRadius: 18,
     backgroundColor: '#4285F4',
-    borderColor: '#4285F4',
+    justifyContent: 'center', alignItems: 'center',
   },
-  sortOptionText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#4285F4',
-  },
-  sortOptionTextActive: {
-    color: '#fff',
-  },
-  cheapestCard: {
-    backgroundColor: '#fff',
-    marginHorizontal: 16,
-    marginTop: 12,
-    borderRadius: 12,
-    overflow: 'hidden',
-    borderWidth: 1,
-    borderColor: '#2196f3',
-  },
-  cheapestBadge: {
-    backgroundColor: '#2196f3',
-    paddingVertical: 4,
-    paddingHorizontal: 10,
-  },
-  cheapestBadgeText: {
-    color: '#fff',
-    fontWeight: '600',
-    fontSize: 11,
-  },
-  cheapestPrice: {
-    fontSize: 22,
-    fontWeight: 'bold',
-    color: '#1976d2',
-  },
-  notWorthIt: {
-    fontSize: 12,
-    color: '#f57c00',
-    paddingHorizontal: 16,
-    paddingBottom: 12,
-  },
-  stationRow: {
+  avatarLetter: { color: '#fff', fontWeight: '700', fontSize: 15 },
+
+  // Grid
+  grid: {
     flexDirection: 'row',
-    alignItems: 'center',
-    padding: 12,
+    flexWrap: 'wrap',
+    paddingHorizontal: 12,
+    gap: 12,
   },
-  logoSmall: {
-    width: 40,
-    height: 40,
-    borderRadius: 6,
-    marginRight: 10,
-  },
-  logoPlaceholder: {
-    width: 40,
-    height: 40,
-    borderRadius: 6,
-    backgroundColor: '#e0e0e0',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginRight: 10,
-  },
-  logoPlaceholderText: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    color: '#9e9e9e',
-  },
-  stationInfo: {
-    flex: 1,
-  },
-  stationName: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#333',
-  },
-  stationDistance: {
-    fontSize: 13,
-    color: '#666',
-    marginTop: 2,
-  },
-  priceContainer: {
-    alignItems: 'flex-end',
-  },
-  stationPrice: {
-    fontSize: 20,
-    fontWeight: 'bold',
-    color: '#333',
-  },
-  lowestPrice: {
-    color: '#4caf50',
-  },
-  perLiterSmall: {
-    fontSize: 12,
-    color: '#888',
-  },
-  stationCard: {
+
+  // Card
+  card: {
     backgroundColor: '#fff',
-    marginHorizontal: 16,
-    marginBottom: 12,
-    borderRadius: 12,
+    borderRadius: 14,
+    overflow: 'hidden',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.08,
-    shadowRadius: 4,
+    shadowRadius: 8,
     elevation: 3,
-    overflow: 'hidden',
-  },
-  baselineCard: {
-    borderWidth: 2,
-    borderColor: '#64b5f6',
-  },
-  worthItCard: {
-    borderWidth: 2,
-    borderColor: '#66bb6a',
-  },
-  bestSavingsCard: {
-    borderWidth: 2,
-    borderColor: '#2e7d32',
   },
   cardHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    padding: 14,
-    backgroundColor: '#fafafa',
-  },
-  cardHeaderLeft: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    flex: 1,
-    marginRight: 12,
-  },
-  cardHeaderInfo: {
-    flex: 1,
-    marginLeft: 10,
-  },
-  logoCard: {
-    width: 44,
-    height: 44,
-    borderRadius: 8,
-  },
-  logoPlaceholderCard: {
-    width: 44,
-    height: 44,
-    borderRadius: 8,
-    backgroundColor: '#e0e0e0',
+    width: '100%',
+    height: 80,
     justifyContent: 'center',
     alignItems: 'center',
+    overflow: 'hidden',
   },
-  cardStationName: {
-    fontSize: 17,
-    fontWeight: '700',
-    color: '#1a1a1a',
-    marginBottom: 2,
+  cardHeaderFeatured: {
+    height: 120,
   },
-  inlineBadge: {
-    alignSelf: 'flex-start',
-    backgroundColor: '#e3f2fd',
-    paddingVertical: 2,
-    paddingHorizontal: 6,
-    borderRadius: 4,
-    marginTop: 2,
+  cardPhoto: {
+    position: 'absolute',
+    width: '100%',
+    height: '100%',
   },
-  inlineBadgeText: {
-    fontSize: 11,
-    color: '#1976d2',
-    fontWeight: '600',
+  cardHeaderLogo: {
+    width: '55%',
+    height: '65%',
   },
-  bestSavingsBadge: {
-    alignSelf: 'flex-start',
-    backgroundColor: '#e8f5e9',
-    paddingVertical: 2,
-    paddingHorizontal: 6,
-    borderRadius: 4,
-    marginTop: 4,
-  },
-  bestSavingsBadgeText: {
-    fontSize: 11,
-    color: '#2e7d32',
-    fontWeight: '700',
-  },
-  cardPriceMain: {
-    alignItems: 'flex-end',
-  },
-  cardPrice: {
-    fontSize: 26,
+  cardHeaderInitial: {
+    fontSize: 36,
     fontWeight: '800',
-    color: '#333',
+    color: 'rgba(255,255,255,0.5)',
   },
-  cardPriceCheapest: {
-    color: '#2e7d32',
+  cardFeatured: {
+    borderWidth: 2,
+    borderColor: '#2e7d32',
+    shadowOpacity: 0.16,
+    shadowRadius: 12,
+    elevation: 6,
   },
-  cardPerLiter: {
-    fontSize: 13,
-    color: '#888',
-    marginTop: -2,
+  worthBadge: {
+    position: 'absolute',
+    top: 8,
+    left: 8,
+    backgroundColor: '#2e7d32',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
   },
-  cardDetails: {
-    flexDirection: 'row',
-    justifyContent: 'space-around',
-    paddingVertical: 12,
-    paddingHorizontal: 14,
-    backgroundColor: '#fff',
-    borderTopWidth: 1,
-    borderTopColor: '#f0f0f0',
-  },
-  detailItem: {
-    alignItems: 'center',
-    flex: 1,
-  },
-  detailLabel: {
-    fontSize: 11,
-    color: '#999',
-    textTransform: 'uppercase',
-    fontWeight: '600',
-    marginBottom: 4,
-  },
-  detailValue: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: '#333',
-  },
-  savingsPositiveText: {
-    color: '#2e7d32',
-  },
-  savingsNeutralText: {
-    color: '#666',
-  },
-  savingsNegativeText: {
-    color: '#d32f2f',
-  },
-  worthItBanner: {
-    backgroundColor: '#e8f5e9',
-    paddingVertical: 8,
-    paddingHorizontal: 14,
-    alignItems: 'center',
-  },
-  worthItBannerText: {
-    fontSize: 13,
-    color: '#2e7d32',
-    fontWeight: '700',
-  },
-  notWorthItBanner: {
-    backgroundColor: '#fff3e0',
-    paddingVertical: 8,
-    paddingHorizontal: 14,
-    alignItems: 'center',
-  },
-  notWorthItBannerText: {
-    fontSize: 13,
-    color: '#f57c00',
-    fontWeight: '600',
-  },
-  savingsRow: {
-    paddingHorizontal: 12,
-    paddingBottom: 12,
-  },
-  savingsPositive: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#4caf50',
-  },
-  tapIndicator: {
-    backgroundColor: '#f5f5f5',
-    paddingVertical: 8,
-    alignItems: 'center',
-    borderTopWidth: 1,
-    borderTopColor: '#eee',
-  },
-  tapIndicatorText: {
-    fontSize: 12,
-    color: '#4285F4',
-    fontWeight: '500',
-  },
-  primaryButton: {
-    backgroundColor: '#4285F4',
-    paddingVertical: 14,
-    paddingHorizontal: 28,
-    borderRadius: 8,
-  },
-  primaryButtonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  refreshButton: {
-    backgroundColor: '#fff',
-    marginHorizontal: 16,
-    paddingVertical: 14,
-    borderRadius: 8,
-    alignItems: 'center',
-    marginTop: 16,
-    borderWidth: 1,
-    borderColor: '#ddd',
-  },
-  refreshText: {
-    fontSize: 16,
-    color: '#333',
-  },
+  featuredBadge: { backgroundColor: '#2e7d32' },
+  closestBadge: { backgroundColor: '#1565c0' },
+  worthBadgeText: { color: '#fff', fontSize: 10, fontWeight: '700' },
+
+  cardBody: { padding: 10 },
+  cardName: { fontSize: 13, fontWeight: '700', color: '#1a1a2e', marginBottom: 4 },
+  cardNameFeatured: { fontSize: 16 },
+  cardPrice: { fontSize: 20, fontWeight: '800', color: '#1a1a2e', marginBottom: 4 },
+  cardPriceFeatured: { fontSize: 28 },
+  cardMeta: { flexDirection: 'row', alignItems: 'center' },
+  cardDist: { fontSize: 12, color: '#666' },
+  cardTime: { fontSize: 12, color: '#666' },
+  cardSavings: { fontSize: 11, fontWeight: '600', marginTop: 4 },
+  cardSavingsFeatured: { fontSize: 14 },
+  savingsPos: { color: '#2e7d32' },
+  savingsNeg: { color: '#c62828' },
 });
